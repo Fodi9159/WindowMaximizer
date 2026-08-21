@@ -1,0 +1,7 @@
+# Build outputs and local junk never belong in history
+bin/
+obj/
+.freebuff/
+nul
+*.log
+*.user
