@@ -1,4 +1,4 @@
-# WindowStateKeeper
+# WindowMaximizer
 
 A small Windows tray app that remembers whether each window was **closed maximized**
 and re-maximizes it the next time it opens. Works for classic Win32 windows
@@ -24,12 +24,12 @@ new work area, since Windows shrinks them; minimized windows are left alone.
 
 ## Usage
 
-Run `WindowStateKeeper.exe` — it lives in the system tray (no console window).
+Run `WindowMaximizer.exe` — it lives in the system tray (no console window).
 Keep it running; it must be alive while windows open and close to record and
 restore state. Right-click the tray icon for the menu:
 
 - **Start with Windows (elevated)** — check/uncheck to enable or disable
-  auto-start at sign-in. Creates a scheduled task (`WindowStateKeeper`, logon
+  auto-start at sign-in. Creates a scheduled task (`WindowMaximizer`, logon
   trigger, highest privileges) that starts the app **as administrator with no
   UAC prompt** — see below for why that matters.
 - **Restart as administrator** — needed for apps that run elevated (see below).
@@ -52,11 +52,11 @@ removes the legacy value, and disabling deletes the task.)
 Headless autostart control (same code path as the menu):
 
 ```
-WindowStateKeeper.exe --autostart on|off     # exit code 0 = ok
-WindowStateKeeper.exe --autostart query      # exit code 0 = enabled, 1 = disabled
+WindowMaximizer.exe --autostart on|off     # exit code 0 = ok
+WindowMaximizer.exe --autostart query      # exit code 0 = enabled, 1 = disabled
 ```
 
-Activity is logged to `WindowStateKeeper.log` next to the exe (falls back to
+Activity is logged to `WindowMaximizer.log` next to the exe (falls back to
 `%LOCALAPPDATA%` if the exe's folder isn't writable). `--verbose` logs every
 window every poll.
 
@@ -70,7 +70,7 @@ window every poll.
 - On each wake it enumerates top-level windows (visible, not cloaked, not owned,
   not tool windows) and reads each window's placement (`GetWindowPlacement`).
 - When a window disappears, its last state is recorded in the registry:
-  `HKCU\Software\WindowStateKeeper` (one DWORD per window key
+  `HKCU\Software\WindowMaximizer` (one DWORD per window key
   `<exe>|<class>`, plus `<title>` for windows whose class is in a per-window
   allowlist — UWP frames, Explorer folders, and Steam's window classes
   (`SDL_app`, `Chrome_WidgetWin_0`, `vguiPopupWindow`) — which would otherwise
@@ -106,11 +106,11 @@ window every poll.
 Requires the .NET 8 SDK:
 
 ```
-cd WindowStateKeeper
+cd WindowMaximizer
 dotnet build -c Release
 ```
 
-The exe lands at `WindowStateKeeper/bin/Release/net8.0-windows/WindowStateKeeper.exe`.
+The exe lands at `WindowMaximizer/bin/Release/net8.0-windows/WindowMaximizer.exe`.
 
 The icon (`app.ico`, 16/24/32/48/256 px) is embedded in the exe and used as the
 tray icon. Regenerate it with `powershell -File gen-icon.ps1` if you want a

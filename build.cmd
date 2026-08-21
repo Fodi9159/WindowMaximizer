@@ -1,5 +1,5 @@
 @echo off
-cd /d "%~dp0WindowStateKeeper"
+cd /d "%~dp0WindowMaximizer"
 dotnet build -c Release
 if errorlevel 1 (
     echo.
@@ -8,5 +8,5 @@ if errorlevel 1 (
     exit /b 1
 )
 echo.
-echo Build OK: %~dp0WindowStateKeeper\bin\Release\net8.0-windows\WindowStateKeeper.exe
-explorer "%~dp0WindowStateKeeper\bin\Release\net8.0-windows"
+echo Build OK: %~dp0WindowMaximizer\bin\Release\net8.0-windows\WindowMaximizer.exe
+explorer "%~dp0WindowMaximizer\bin\Release\net8.0-windows"

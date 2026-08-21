@@ -10,7 +10,7 @@ using System.Text.RegularExpressions;
 using System.Windows.Forms;
 using Microsoft.Win32;
 
-// WindowStateKeeper: remembers whether each top-level window was closed
+// WindowMaximizer: remembers whether each top-level window was closed
 // maximized, and re-maximizes it the next time it opens. Works for classic
 // Win32 windows and UWP apps (ApplicationFrameHost frame windows).
 //
@@ -18,7 +18,7 @@ using Microsoft.Win32;
 // Windows (elevated)" (creates/removes a logon scheduled task), "Restart as
 // administrator", and "Exit".
 //
-// State is stored per window "key" in HKCU\Software\WindowStateKeeper.
+// State is stored per window "key" in HKCU\Software\WindowMaximizer.
 // A window's key is "<exe>|<class>" (plus "|<title>" for UWP frame windows,
 // which share exe/class across apps, and Explorer windows, which share
 // exe/class across folders - the title is what separates them).
@@ -140,10 +140,10 @@ internal static class Program
     private const uint SMTO_ABORTIFHUNG = 0x0002;
     private const uint TextTimeoutMs = 300;
 
-    private const string RegRoot = @"Software\WindowStateKeeper";
+    private const string RegRoot = @"Software\WindowMaximizer";
     private const string RunKeyPath = @"Software\Microsoft\Windows\CurrentVersion\Run";
-    private const string RunValueName = "WindowStateKeeper";
-    private const string AutoStartTaskName = "WindowStateKeeper";
+    private const string RunValueName = "WindowMaximizer";
+    private const string AutoStartTaskName = "WindowMaximizer";
     private const string UwpFrameExe = "ApplicationFrameHost.exe";
     private static readonly TimeSpan RestoreGiveUp = TimeSpan.FromSeconds(15);
     // Safety-net poll cadence. Detection is event-driven (SetWinEventHook wakes the
@@ -245,7 +245,7 @@ internal static class Program
         // Placed AFTER the --autostart CLI block above so toggling autostart
         // while the app runs still works (the CLI path exits before this).
         // Held in a field for the process lifetime - disposing it would release it.
-        _instanceMutex = new Mutex(true, @"Local\WindowStateKeeper.SingleInstance", out bool firstInstance);
+        _instanceMutex = new Mutex(true, @"Local\WindowMaximizer.SingleInstance", out bool firstInstance);
         if (!firstInstance)
         {
             Log("second instance detected; exiting");
@@ -288,7 +288,7 @@ internal static class Program
             _notifyIcon = new NotifyIcon
             {
                 Icon = _trayIcon,
-                Text = "WindowStateKeeper",
+                Text = "WindowMaximizer",
                 ContextMenuStrip = BuildMenu(),
                 Visible = true,
             };
@@ -296,8 +296,8 @@ internal static class Program
         catch (Exception ex)
         {
             Log("tray init failed: " + ex);
-            MessageBox.Show("WindowStateKeeper could not start its tray icon:\n" + ex.Message,
-                "WindowStateKeeper", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            MessageBox.Show("WindowMaximizer could not start its tray icon:\n" + ex.Message,
+                "WindowMaximizer", MessageBoxButtons.OK, MessageBoxIcon.Error);
             return 1;
         }
 
@@ -424,7 +424,7 @@ internal static class Program
     {
         try
         {
-            _notifyIcon?.ShowBalloonTip(8000, "WindowStateKeeper",
+            _notifyIcon?.ShowBalloonTip(8000, "WindowMaximizer",
                 $"Couldn't restore \"{key}\" to maximized. The window is likely running elevated " +
                 "(e.g. Task Manager), which Windows hides from non-admin apps. Right-click this icon " +
                 "and choose \"Restart as administrator\" to restore it.",
@@ -1410,7 +1410,7 @@ internal static class Program
         {
             try
             {
-                var path = Path.Combine(dir, "WindowStateKeeper.log");
+                var path = Path.Combine(dir, "WindowMaximizer.log");
                 File.AppendAllText(path, "");
                 return path;
             }

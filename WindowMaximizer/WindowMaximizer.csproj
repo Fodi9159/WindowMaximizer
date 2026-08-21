@@ -6,8 +6,8 @@
     <UseWindowsForms>true</UseWindowsForms>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
-    <AssemblyName>WindowStateKeeper</AssemblyName>
-    <RootNamespace>WindowStateKeeper</RootNamespace>
+    <AssemblyName>WindowMaximizer</AssemblyName>
+    <RootNamespace>WindowMaximizer</RootNamespace>
     <ApplicationIcon>app.ico</ApplicationIcon>
   </PropertyGroup>
 
