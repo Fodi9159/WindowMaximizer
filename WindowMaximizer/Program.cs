@@ -57,6 +57,9 @@ internal static class Program
     private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
 
     [DllImport("user32.dll")]
+    private static extern bool SetWindowPlacement(IntPtr hWnd, ref WINDOWPLACEMENT lpwndpl);
+
+    [DllImport("user32.dll")]
     private static extern IntPtr SetWinEventHook(uint eventMin, uint eventMax, IntPtr hmodWinEventProc,
         WinEventDelegate lpfnWinEventProc, uint idProcess, uint idThread, uint dwFlags);
 
@@ -545,6 +548,24 @@ internal static class Program
 
     // ---- Window watcher ----
 
+    // Maximizes a window WITHOUT stealing keyboard focus. The previous
+    // implementation used ShowWindow(SW_SHOWMAXIMIZED), whose activation yanked
+    // keyboard focus away from whatever the user was typing in - every call here
+    // can fire on a background window (retry loop, re-assert, re-launch spike, a
+    // hidden window re-showing). SetWindowPlacement applies the maximize without
+    // activating; verified: the foreground window keeps focus through it.
+    private static void MaximizeNoSteal(IntPtr hwnd)
+    {
+        var wp = new WINDOWPLACEMENT { length = Marshal.SizeOf<WINDOWPLACEMENT>() };
+        if (!GetWindowPlacement(hwnd, ref wp))
+        {
+            ShowWindow(hwnd, SW_SHOWMAXIMIZED); // placement unavailable: legacy path (activates)
+            return;
+        }
+        wp.showCmd = SW_SHOWMAXIMIZED;
+        SetWindowPlacement(hwnd, ref wp);
+    }
+
     private static void WatcherLoop(bool verbose)
     {
         var previous = new Dictionary<IntPtr, WinInfo>();
@@ -552,6 +573,9 @@ internal static class Program
         // (re-launch poller and loop body below, after window-state declarations)
         // key -> when to stop forcing it maximized (a window may fight back during startup)
         var restoreUntil = new Dictionary<string, DateTime>(StringComparer.Ordinal);
+        // Per key: when the retry loop last tried to maximize (throttled to 1/s, see
+        // the restoreUntil block). Pruned alongside restoreUntil in the sweep below.
+        var lastRestoreTry = new Dictionary<string, DateTime>(StringComparer.Ordinal);
         // Closes are grouped per key for a few seconds: an app can close several
         // windows at once (e.g. Win11 Notepad owns several visible "Notepad"
         // windows). The window whose state changed most recently decides the
@@ -819,7 +843,7 @@ internal static class Program
                             {
                                 lastMaxAssert[hwnd] = DateTime.Now;
                                 Log($"re-assert {hwnd:X} {info.Key} (re-launch demoted a maximized window)");
-                                ShowWindow(hwnd, SW_SHOWMAXIMIZED);
+                                MaximizeNoSteal(hwnd);
                             }
                         }
                     }
@@ -855,14 +879,13 @@ internal static class Program
                         // Re-assert maximize ONLY when a re-launch spike (a 2nd short-lived
                         // process) explains the revert - that's the single-instance app
                         // demoting its own window. A genuine user Restore has no spike, so it
-                        // is never re-maximized. lastMaxAssert covers WSK-initiated maximizes.
-                        else if ((lastMaxAssert.TryGetValue(hwnd, out var asserted) && DateTime.Now - asserted <= reAssertGrace)
-                              || (lastMaximizedAt.TryGetValue(hwnd, out var lastMax) && DateTime.Now - lastMax <= reAssertGrace
-                                  && previous.TryGetValue(hwnd, out var pinf) && exeSpikeAt.TryGetValue(pinf.Exe, out var spiked) && DateTime.Now - spiked <= relaunchGrace))
+                        // is never re-maximized.
+                        else if (lastMaximizedAt.TryGetValue(hwnd, out var lastMax) && DateTime.Now - lastMax <= reAssertGrace
+                            && previous.TryGetValue(hwnd, out var pinf) && exeSpikeAt.TryGetValue(pinf.Exe, out var spiked) && DateTime.Now - spiked <= relaunchGrace)
                         {
                             lastMaxAssert[hwnd] = DateTime.Now;
-                            Log($"re-assert {hwnd:X} (app reverted a freshly-maximized window)");
-                            ShowWindow(hwnd, SW_SHOWMAXIMIZED);
+                            Log($"re-assert {hwnd:X} (re-launch spike reverted a maximized window)");
+                            MaximizeNoSteal(hwnd);
                         }
                         if (lastShowCmd.TryGetValue(hwnd, out var prevCmd))
                         {
@@ -877,7 +900,7 @@ internal static class Program
                                 // folder window to normal): re-maximize it.
                                 Log($"restored {hwnd:X} (minimized->normal, intent maximized)");
                                 lastMaxAssert[hwnd] = DateTime.Now;
-                                ShowWindow(hwnd, SW_SHOWMAXIMIZED);
+                                MaximizeNoSteal(hwnd);
                             }
                         }
                         lastShowCmd[hwnd] = placement.showCmd;
@@ -903,7 +926,7 @@ internal static class Program
                         if (placement.showCmd == SW_SHOWMAXIMIZED
                             || (maximizedIntent.TryGetValue(hwnd, out var intent) && intent))
                         {
-                            ShowWindow(hwnd, SW_SHOWMAXIMIZED);
+                            MaximizeNoSteal(hwnd);
                             reMaxed++;
                         }
                     }
@@ -1018,7 +1041,7 @@ internal static class Program
                             // fallback path when the fast pass didn't run.
                             Log($"restored {hwnd:X} (minimized->normal, intent maximized)");
                             lastMaxAssert[hwnd] = DateTime.Now;
-                            ShowWindow(hwnd, SW_SHOWMAXIMIZED);
+                            MaximizeNoSteal(hwnd);
                         }
                     }
                     lastShowCmd[hwnd] = info.ShowCmd;
@@ -1068,8 +1091,16 @@ internal static class Program
                             restoreUntil.Remove(info.Key);
                             continue;
                         }
-                        lastMaxAssert[hwnd] = DateTime.Now;
-                        ShowWindow(hwnd, SW_SHOWMAXIMIZED);
+                        // Retry at most once per second: this loop runs every fast pass
+                        // (~100ms), and each try activates the window - a stubborn window
+                        // used to be hammered with activation for up to RestoreGiveUp.
+                        if (!lastRestoreTry.TryGetValue(info.Key, out var lastTry)
+                            || DateTime.Now - lastTry >= TimeSpan.FromSeconds(1))
+                        {
+                            lastRestoreTry[info.Key] = DateTime.Now;
+                            lastMaxAssert[hwnd] = DateTime.Now;
+                            MaximizeNoSteal(hwnd);
+                        }
                     }
                     // Restore only when the window just opened (isNew): once the user
                     // un-maximizes an already-open window we must not fight them.
@@ -1114,7 +1145,7 @@ internal static class Program
                         restoreUntil[info.Key] = DateTime.Now + RestoreGiveUp;
                         Log($"restored {hwnd:X} {info.Key}");
                         lastMaxAssert[hwnd] = DateTime.Now;
-                        ShowWindow(hwnd, SW_SHOWMAXIMIZED);
+                        MaximizeNoSteal(hwnd);
                     }
                 }
 
@@ -1132,6 +1163,9 @@ internal static class Program
                 foreach (var h in reAppearMax.Keys.ToList())
                     if (DateTime.Now - reAppearMax[h] > reAppearGrace)
                         reAppearMax.Remove(h);
+                foreach (var k in lastRestoreTry.Keys.ToList())
+                    if (!restoreUntil.ContainsKey(k))
+                        lastRestoreTry.Remove(k);
 
                 // Schedule the next full pass here (not at the top): the counts for
                 // closedAt/reAppearMax updated during THIS pass must decide the
@@ -1223,7 +1257,7 @@ internal static class Program
                 if (!shouldRestore) return false;
                 Log($"restored {hwnd:X} {key} (immediate)");
                 lastMaxAssert[hwnd] = DateTime.Now;
-                ShowWindow(hwnd, SW_SHOWMAXIMIZED);
+                MaximizeNoSteal(hwnd);
                 return false;
             }
             catch
@@ -1363,6 +1397,112 @@ internal static class Program
         using var keyHandle = Registry.CurrentUser.CreateSubKey(RegRoot);
         keyHandle.SetValue(RegValueName(key), maximized ? 1 : 0, RegistryValueKind.DWord);
         Log($"closed {key} ({(maximized ? "maximized" : "normal")})");
+        SyncShortcutRunState(key, maximized);
+    }
+
+    // ---- Shortcut Run-state sync ----
+    //
+    // The native mechanism: a shortcut (.lnk) whose Properties > Run is set to
+    // "Maximized" makes Windows open the app maximized from its very first
+    // frame - no flash, no fight. When an app is recorded closing maximized we
+    // point its launcher shortcut there (and back to Normal on a normal close),
+    // so the two mechanisms agree. Apps with no findable/editable shortcut
+    // (UWP frames, Explorer, exes launched directly, launcher-borne games)
+    // simply keep using the registry restore above.
+
+    private static object? _shellObj;
+    private static dynamic ShellCom => _shellObj ??=
+        Activator.CreateInstance(Type.GetTypeFromProgID("WScript.Shell")!)
+        ?? throw new InvalidOperationException("WScript.Shell unavailable");
+
+    private static readonly object LnkLock = new();
+    // exe name -> shortcut path, or null once scanned and not found (so a
+    // shortcut-less app costs one directory scan ever, not one per close).
+    private static readonly Dictionary<string, string?> LnkForExe = new(StringComparer.OrdinalIgnoreCase);
+
+    private static void SyncShortcutRunState(string key, bool maximized)
+    {
+        try
+        {
+            var exe = key.Split('|')[0];
+            // Hosts that carry other apps' windows: their "shortcut" isn't the app's.
+            if (exe.Equals(UwpFrameExe, StringComparison.OrdinalIgnoreCase)
+                || exe.Equals("explorer.exe", StringComparison.OrdinalIgnoreCase))
+                return;
+
+            string? lnk;
+            lock (LnkLock)
+            {
+                if (!LnkForExe.TryGetValue(exe, out lnk))
+                    LnkForExe[exe] = lnk = FindShortcutForExe(exe);
+            }
+            if (lnk == null) return;
+
+            dynamic link = ShellCom.CreateShortcut(lnk);
+            int want = maximized ? SW_SHOWMAXIMIZED : SW_SHOWNORMAL;
+            if ((int)link.WindowStyle != want)
+            {
+                link.WindowStyle = want;
+                link.Save();
+                Log($"shortcut {Path.GetFileName(lnk)} Run -> {(maximized ? "maximized" : "normal")}");
+            }
+        }
+        catch (Exception ex)
+        {
+            Log("shortcut sync failed: " + ex.Message);
+        }
+    }
+
+    private static string? FindShortcutForExe(string exe)
+    {
+        foreach (var dir in ShortcutDirs())
+        {
+            foreach (var lnk in SafeEnumerateLnks(dir))
+            {
+                try
+                {
+                    dynamic link = ShellCom.CreateShortcut(lnk);
+                    string target = ((string)link.TargetPath).Trim();
+                    // Match by target file name: the key only stores the exe name,
+                    // not its folder. ponytail: name-only match; a same-named exe in
+                    // two folders picks whichever shortcut is found first.
+                    if (string.Equals(Path.GetFileName(target), exe, StringComparison.OrdinalIgnoreCase))
+                        return lnk;
+                }
+                catch { } // unreadable .lnk: skip it
+            }
+        }
+        return null;
+    }
+
+    private static IEnumerable<string> ShortcutDirs()
+    {
+        foreach (var d in new[]
+        {
+            Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory),
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+                @"Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar"),
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.StartMenu), "Programs"),
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonStartMenu), "Programs"),
+        })
+        {
+            if (Directory.Exists(d)) yield return d;
+        }
+    }
+
+    private static IEnumerable<string> SafeEnumerateLnks(string dir)
+    {
+        // ponytail: IgnoreInaccessible skips locked subfolders instead of aborting
+        // the whole scan (the old try/catch lost every lnk before the error).
+        try
+        {
+            return Directory.EnumerateFiles(dir, "*.lnk", new EnumerationOptions
+            {
+                RecurseSubdirectories = true,
+                IgnoreInaccessible = true,
+            });
+        }
+        catch { return Enumerable.Empty<string>(); }
     }
 
     // ---- Logging ----
