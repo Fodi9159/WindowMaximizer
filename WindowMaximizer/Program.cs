@@ -1598,6 +1598,54 @@ internal static class Program
 
                 var exe = GetProcessName(pid);
                 var title = GetWindowTextSafe(hwnd);
+                // Explorer shows generic "File Explorer" first, then the folder name
+                // (~300-500ms, Explorer internal). For a generic/empty title use the
+                // shell window location (available ms after creation, before the title)
+                // to get the real folder at once instead of flashing normal: parse the
+                // file URL to the expected "Name - File Explorer" key and decide from
+                // that (record/sibling, same as below). Unknown locations (shell GUIDs,
+                // drive roots, COM hiccups) fall back to waiting for the title.
+                if ((title.Length == 0 || title == "File Explorer")
+                    && exe.Equals("explorer.exe", StringComparison.OrdinalIgnoreCase) && cls == "CabinetWClass")
+                {
+                    var expected = TryGetExplorerExpectedKey(hwnd, exe, cls);
+                    if (expected.HasValue)
+                    {
+                        var (expTitle, expBase, expKey) = expected.Value;
+                        bool expRestore;
+                        if (pending.TryGetValue(expKey, out var epc))
+                            expRestore = epc.Maximized;
+                        else
+                        {
+                            var erec = RecordState(expKey);
+                            if (erec == 1)
+                                expRestore = true;
+                            else if (erec == 0)
+                                expRestore = false;
+                            else
+                            {
+                                expRestore = false;
+                                foreach (var (oh, oinfo) in previous)
+                                {
+                                    if (oh == hwnd || oinfo.BaseKey != expBase) continue;
+                                    if (oinfo.Maximized || intendedMaximized.Contains(oh))
+                                    { expRestore = true; break; }
+                                }
+                            }
+                        }
+                        if (expRestore)
+                        {
+                            Log($"restored {hwnd:X} {expKey} (immediate, via location for '{expTitle}')");
+                            lastMaxAssert[hwnd] = DateTime.Now;
+                            MaximizeNoSteal(hwnd);
+                            return false;
+                        }
+                        // Expected says normal (or unknown with no maximized sibling):
+                        // fall through to title watching below so a normal folder never
+                        // flashes maximized. (Return true = keep watching for settle.)
+                        return true;
+                    }
+                }
                 // An empty title may be a transient read failure (busy thread) on a
                 // window that will get a title, or a genuinely untitled window. Either
                 // way, don't decide on the shared exe|class key here: the full pass
@@ -1675,6 +1723,51 @@ internal static class Program
             catch
             {
                 return false; // the fast path must never take the watcher down
+            }
+        }
+
+        // Expected folder key for a still-generic Explorer window, via the shell
+        // window location (ms after creation, before Explorer sets the title).
+        // Returns null when unavailable (not yet registered/navigated, shell GUID,
+        // drive root, COM hiccup): caller falls back to waiting for the title.
+        // Local function: watcher thread only, shares hwndInstance for the
+        // provisional instance slot (same slot the title path will reuse when the
+        // title settles, since the base key matches).
+        (string Title, string BaseKey, string Key)? TryGetExplorerExpectedKey(IntPtr hwnd, string exe, string cls)
+        {
+            try
+            {
+                _shellWindowsApp ??= Activator.CreateInstance(Type.GetTypeFromProgID("Shell.Application")!);
+                if (_shellWindowsApp == null) return null;
+                int want;
+                try { want = hwnd.ToInt32(); }
+                catch { return null; } // 64-bit HWND overflow: fall back to title
+                foreach (var win in _shellWindowsApp.Windows())
+                {
+                    int h;
+                    try { h = (int)win.HWND; }
+                    catch { continue; }
+                    if (h != want) continue;
+                    string? loc = null;
+                    try { loc = (string)win.LocationURL; } catch { return null; }
+                    if (string.IsNullOrEmpty(loc) || !loc.StartsWith("file:///", StringComparison.OrdinalIgnoreCase))
+                        return null; // shell GUID / not navigated yet: wait for title
+                    string local;
+                    try { local = new Uri(loc).LocalPath; }
+                    catch { return null; }
+                    string name = Path.GetFileName(local.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
+                    if (string.IsNullOrEmpty(name)) return null; // drive root: title differs, wait
+                    string expTitle = name + " - File Explorer";
+                    string expBase = BuildBaseKey(exe, cls, expTitle);
+                    int inst = AssignInstance(hwnd, expBase, hwndInstance);
+                    string expKey = inst <= 1 ? expBase : $"{expBase}|#{inst}";
+                    return (expTitle, expBase, expKey);
+                }
+                return null; // not registered yet: retry on next poll
+            }
+            catch
+            {
+                return null; // COM hiccup: fall back to title watching (safe)
             }
         }
     }
@@ -1910,6 +2003,12 @@ internal static class Program
     private static dynamic ShellCom => _shellObj ??=
         Activator.CreateInstance(Type.GetTypeFromProgID("WScript.Shell")!)
         ?? throw new InvalidOperationException("WScript.Shell unavailable");
+
+    // Shell.Application for instant folder lookup (watcher thread only, like the
+    // immediate path that uses it: new Explorer windows show generic
+    // "File Explorer" ~300-500ms before the folder title, but LocationURL is
+    // available ms after creation).
+    private static dynamic? _shellWindowsApp;
 
     private static readonly object LnkLock = new();
     // exe name -> shortcut path, or null once scanned and not found (so a
