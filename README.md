@@ -58,7 +58,8 @@ WindowMaximizer.exe --autostart query      # exit code 0 = enabled, 1 = disabled
 
 Activity is logged to `WindowMaximizer.log` next to the exe (falls back to
 `%LOCALAPPDATA%` if the exe's folder isn't writable). `--verbose` logs every
-window every poll.
+window every poll plus a periodic heartbeat with watcher-pass and census-scan
+timings and managed-heap size.
 
 ## How it works
 
@@ -71,10 +72,10 @@ window every poll.
   not tool windows) and reads each window's placement (`GetWindowPlacement`).
 - When a window disappears, its last state is recorded in the registry:
   `HKCU\Software\WindowMaximizer` (one DWORD per window key
-  `<exe>|<class>`, plus `<title>` for windows whose class is in a per-window
-  allowlist — UWP frames, Explorer folders, and Steam's window classes
-  (`SDL_app`, `Chrome_WidgetWin_0`, `vguiPopupWindow`) — which would otherwise
-  share one key across all apps / all folders / all Steam dialogs). State
+  `<exe>|<class>|<title>`, or `<exe>|<class>` when the window has no title).
+  Each titled window gets its own key so two Explorer folders or two Chrome
+  windows keep separate state. Registry value names are SHA-1 hex digests of
+  the key string (registry value names cannot contain backslashes). State
   survives app restarts.
 - **Same-title windows are disambiguated per instance**: the first window of a
   given key is stored under the plain key, the second under `|#2`, the third
@@ -93,8 +94,8 @@ window every poll.
 - Closes are grouped per key (an app like Win11 Notepad owns several visible
   windows at once), and a short "recently maximized" history covers UWP's
   teardown animation, which briefly reverts the frame to normal on close.
-- Window text is read with `SendMessageTimeout` and only for windows whose
-  class is in the per-window allowlist, so a hung window anywhere on the system
+- Window text is read with `SendMessageTimeout` (never `GetWindowText`, which
+  blocks forever on a hung window), so a hung window anywhere on the system
   can never block the watcher. (Explorer first shows a generic "File Explorer"
   title, then the folder name; a window whose key changes is re-evaluated
   against the new key so the restore isn't missed.)
@@ -103,14 +104,14 @@ window every poll.
 
 ## Build
 
-Requires the .NET 8 SDK:
+Requires the .NET 10 SDK:
 
 ```
 cd WindowMaximizer
 dotnet build -c Release
 ```
 
-The exe lands at `WindowMaximizer/bin/Release/net8.0-windows/WindowMaximizer.exe`.
+The exe lands at `WindowMaximizer/bin/Release/net10.0-windows/WindowMaximizer.exe`.
 
 The icon (`app.ico`, 16/24/32/48/256 px) is embedded in the exe and used as the
 tray icon. Regenerate it with `powershell -File gen-icon.ps1` if you want a

@@ -60,6 +60,9 @@ internal static class Program
     private static extern bool SetWindowPlacement(IntPtr hWnd, ref WINDOWPLACEMENT lpwndpl);
 
     [DllImport("user32.dll")]
+    private static extern IntPtr GetForegroundWindow();
+
+    [DllImport("user32.dll")]
     private static extern IntPtr SetWinEventHook(uint eventMin, uint eventMax, IntPtr hmodWinEventProc,
         WinEventDelegate lpfnWinEventProc, uint idProcess, uint idThread, uint dwFlags);
 
@@ -71,6 +74,9 @@ internal static class Program
 
     [DllImport("dwmapi.dll")]
     private static extern int DwmGetWindowAttribute(IntPtr hwnd, uint dwAttribute, out int pvAttribute, int cbAttribute);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern uint RegisterWindowMessage(string lpString);
 
     // Cheap process census for the re-launch poller (see WatcherLoop): EnumProcesses
     // returns a bare pid list (~microseconds); names are resolved once per pid.
@@ -123,6 +129,7 @@ internal static class Program
     private const uint EVENT_OBJECT_SHOW = 0x8002;
     private const uint EVENT_OBJECT_HIDE = 0x8003;
     private const uint EVENT_OBJECT_STATECHANGE = 0x800A;
+    private const uint EVENT_OBJECT_NAMECHANGE = 0x800C;
     private const uint WINEVENT_OUTOFCONTEXT = 0x0000;
     private const uint WINEVENT_SKIPOWNPROCESS = 0x0002;
     private const int OBJID_WINDOW = 0;
@@ -156,8 +163,9 @@ internal static class Program
     // While a window was recently maximized we watch its placement at this rate:
     // no WinEvent fires for maximize/un-maximize on Windows 11, so a prompt poll
     // is the only way to observe a deliberate un-maximize (and separate it from
-    // a UWP close-animation revert).
-    private const int FastPollMs = 100;
+    // a UWP close-animation revert). 200ms halves the fast-pass CPU vs. 100ms;
+    // all grace rules are time-based, so only detection latency changes (+100ms).
+    private const int FastPollMs = 200;
 
     private sealed class WinInfo
     {
@@ -187,10 +195,13 @@ internal static class Program
         public string Key => Instance <= 1 ? BaseKey : $"{BaseKey}|#{Instance}";
     }
 
+    // ponytail: compiled once; the pattern is fixed-length so this avoids re-parsing every call.
+    private static readonly Regex WpfGuidSuffix = new(@";[0-9a-fA-F-]{36}", RegexOptions.Compiled);
+
     private static string BuildBaseKey(string exe, string cls, string title) =>
         string.IsNullOrEmpty(title)
-            ? $"{exe}|{Regex.Replace(cls, @";[0-9a-fA-F-]{36}", "")}"
-            : $"{exe}|{Regex.Replace(cls, @";[0-9a-fA-F-]{36}", "")}|{title}";
+            ? $"{exe}|{WpfGuidSuffix.Replace(cls, "")}"
+            : $"{exe}|{WpfGuidSuffix.Replace(cls, "")}|{title}";
 
     private static readonly HashSet<string> IgnoredClasses = new(StringComparer.OrdinalIgnoreCase)
     {
@@ -213,6 +224,9 @@ internal static class Program
     // maximized intent (re-launch re-max only matters then). The watcher loop sets
     // this each pass; the poller skips the Process scan when idle so it sleeps.
     private static volatile bool _spikeActive;
+    private static uint _wmTaskbarCreated;
+    private static Form? _hiddenForm;
+    private static TaskbarNativeWindow? _msgWindow;
 
     [STAThread]
     private static int Main(string[] args)
@@ -255,13 +269,21 @@ internal static class Program
             return 0;
         }
 
+        // Self-heal a stale scheduled task left from before the power-settings fix
+        // (StopIfGoingOnBatteries=true kills the task-launched instance on sleep/wake).
+        try { EnsureAutoStartTaskHealthy(); } catch (Exception ex) { Log("task heal check failed: " + ex.Message); }
+
+        // Register for TaskbarCreated (Explorer restart) so the tray icon is
+        // recreated instead of silently vanishing while the process keeps running.
+        try { _wmTaskbarCreated = RegisterWindowMessage("TaskbarCreated"); } catch { }
+
         // Event-driven detection: wake the watcher the moment a window is created,
         // shown, hidden, destroyed, or toggles maximize/minimize. The callback runs
         // on this (message-pumping) thread and just signals the watcher thread, so
         // all window logic stays on one thread. The fallback poll covers gaps.
         _wakeEvent = new AutoResetEvent(false);
         _winEventProc = WinEventProc;
-        _winEventHook = SetWinEventHook(EVENT_OBJECT_CREATE, EVENT_OBJECT_STATECHANGE,
+        _winEventHook = SetWinEventHook(EVENT_OBJECT_CREATE, EVENT_OBJECT_NAMECHANGE,
             IntPtr.Zero, _winEventProc, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
         if (_winEventHook == IntPtr.Zero)
             Log("WARNING: SetWinEventHook failed; relying on the fallback poll only");
@@ -283,18 +305,48 @@ internal static class Program
             if (_winEventHook != IntPtr.Zero) { UnhookWinEvent(_winEventHook); _winEventHook = IntPtr.Zero; }
             if (_notifyIcon != null) { _notifyIcon.Visible = false; _notifyIcon.Dispose(); }
             _trayIcon?.Dispose();
+            try { _regRead?.Dispose(); } catch { }
+            _regRead = null;
+            try { _hiddenForm?.Dispose(); } catch { }
+            try { _msgWindow?.DestroyHandle(); } catch { }
         };
+
+        // SystemEvents needs a pump (we have one via Application.Run). Register
+        // before any Control is created (same restriction as SetUnhandledExceptionMode).
+        try
+        {
+            SystemEvents.PowerModeChanged += (s, e) =>
+            {
+                Log($"power {e.Mode}");
+                if (e.Mode == PowerModes.Resume)
+                {
+                    _wakeEvent?.Set();
+                    _displayChanged = true;
+                    try { RehookWinEvent(); } catch { }
+                    try { RecreateTrayIcon(); } catch (Exception ex) { Log("resume tray recreate failed: " + ex.Message); }
+                }
+                else if (e.Mode == PowerModes.Suspend)
+                {
+                    Log("power suspend");
+                }
+            };
+            SystemEvents.SessionEnding += (s, e) => Log($"session ending {e.Reason}");
+            SystemEvents.SessionSwitch += (s, e) => Log($"session switch {e.Reason}");
+        }
+        catch (Exception ex) { Log("SystemEvents hook failed: " + ex.Message); }
+
+        // Hidden form keeps a top-level window handle on this thread so
+        // TaskbarCreated broadcasts are delivered, and provides an Invoke
+        // target for cross-thread tray recreation (e.g. from SystemEvents).
+        _hiddenForm = new TaskbarForm();
+        // Force handle creation without showing
+        var _h = _hiddenForm.Handle;
+        _msgWindow = new TaskbarNativeWindow();
+        Log($"msg windows created form={_h:X} native={_msgWindow.Handle:X} taskbarMsg={_wmTaskbarCreated}");
 
         try
         {
-            _trayIcon = LoadIcon();
-            _notifyIcon = new NotifyIcon
-            {
-                Icon = _trayIcon,
-                Text = "WindowMaximizer",
-                ContextMenuStrip = BuildMenu(),
-                Visible = true,
-            };
+            CreateTrayIcon();
         }
         catch (Exception ex)
         {
@@ -376,6 +428,16 @@ internal static class Program
                 if (idObject == OBJID_WINDOW)
                     _wakeEvent?.Set();
                 break;
+            case EVENT_OBJECT_NAMECHANGE:
+                // Explorer first shows "File Explorer", then the folder name: retry the
+                // immediate restore the moment the title settles instead of waiting for
+                // the next poll, so a reopened maximized folder snaps without flashing.
+                if (idObject == OBJID_WINDOW)
+                {
+                    ShowQueue.Enqueue(hwnd);
+                    _wakeEvent?.Set();
+                }
+                break;
             case EVENT_OBJECT_STATECHANGE:
                 // A maximize just before closing must be observed to record
                 // "closed maximized" (idChild carries the new state flags).
@@ -387,7 +449,9 @@ internal static class Program
 
     // Windows broadcasts WM_DISPLAYCHANGE when the display resolution changes or
     // a monitor is plugged/unplugged; it shrinks maximized windows, so wake the
-    // watcher to re-maximize them against the new work area.
+    // watcher to re-maximize them against the new work area. Also handles
+    // TaskbarCreated (Explorer restart) which would otherwise leave the tray
+    // icon invisible while the process keeps running.
     private sealed class DisplayChangeFilter : IMessageFilter
     {
         public bool PreFilterMessage(ref Message m)
@@ -397,7 +461,71 @@ internal static class Program
                 _displayChanged = true;
                 _wakeEvent?.Set();
             }
+            else if (_wmTaskbarCreated != 0 && m.Msg == (int)_wmTaskbarCreated)
+            {
+                Log("TaskbarCreated received (Explorer restarted); recreating tray icon (filter)");
+                try { RecreateTrayIcon(); } catch (Exception ex) { Log("tray recreate failed: " + ex.Message); }
+                _wakeEvent?.Set();
+            }
             return false;
+        }
+    }
+
+    private sealed class TaskbarForm : Form
+    {
+        public TaskbarForm()
+        {
+            ShowInTaskbar = false;
+            FormBorderStyle = FormBorderStyle.None;
+            Opacity = 0;
+            Visible = false;
+            WindowState = FormWindowState.Minimized;
+        }
+        protected override void WndProc(ref Message m)
+        {
+            if (_wmTaskbarCreated != 0 && m.Msg == (int)_wmTaskbarCreated)
+            {
+                Log("TaskbarCreated received (Explorer restarted); recreating tray icon (wndproc)");
+                try { RecreateTrayIcon(); } catch (Exception ex) { Log("tray recreate failed: " + ex.Message); }
+                _wakeEvent?.Set();
+            }
+            else if (m.Msg == WM_DISPLAYCHANGE)
+            {
+                _displayChanged = true;
+                _wakeEvent?.Set();
+            }
+            base.WndProc(ref m);
+        }
+        protected override void SetVisibleCore(bool value) { if (!IsHandleCreated) base.SetVisibleCore(false); else base.SetVisibleCore(value); }
+    }
+
+    private sealed class TaskbarNativeWindow : NativeWindow
+    {
+        public TaskbarNativeWindow()
+        {
+            var cp = new CreateParams
+            {
+                Caption = "WindowMaximizerMsg",
+                Style = unchecked((int)0x80000000), // WS_POPUP
+                ExStyle = 0x80, // WS_EX_TOOLWINDOW
+                Parent = IntPtr.Zero,
+            };
+            CreateHandle(cp);
+        }
+        protected override void WndProc(ref Message m)
+        {
+            if (_wmTaskbarCreated != 0 && m.Msg == (int)_wmTaskbarCreated)
+            {
+                Log("TaskbarCreated received (Explorer restarted); recreating tray icon (native)");
+                try { RecreateTrayIcon(); } catch (Exception ex) { Log("tray recreate failed: " + ex.Message); }
+                _wakeEvent?.Set();
+            }
+            else if (m.Msg == WM_DISPLAYCHANGE)
+            {
+                _displayChanged = true;
+                _wakeEvent?.Set();
+            }
+            base.WndProc(ref m);
         }
     }
 
@@ -445,6 +573,91 @@ internal static class Program
         if (exePath != null && File.Exists(exePath))
             return Icon.ExtractAssociatedIcon(exePath) ?? throw new InvalidOperationException("no icon in exe");
         throw new InvalidOperationException("icon not found");
+    }
+
+    private static void CreateTrayIcon()
+    {
+        _trayIcon?.Dispose();
+        _trayIcon = LoadIcon();
+        if (_notifyIcon != null) { try { _notifyIcon.Visible = false; _notifyIcon.Dispose(); } catch { } }
+        _notifyIcon = new NotifyIcon
+        {
+            Icon = _trayIcon,
+            Text = "WindowMaximizer",
+            ContextMenuStrip = BuildMenu(),
+            Visible = true,
+        };
+    }
+
+    private static void RecreateTrayIcon()
+    {
+        // Must run on the UI thread (message pump). If called from
+        // SystemEvents thread, marshal via the hidden form.
+        if (_hiddenForm != null && _hiddenForm.InvokeRequired)
+        {
+            try { _hiddenForm.BeginInvoke(new Action(RecreateTrayIcon)); } catch { }
+            return;
+        }
+        try
+        {
+            // If icon is already visible and Explorer just restarted, Windows
+            // clears the icon. Toggle Visible to force re-add.
+            if (_notifyIcon != null)
+            {
+                try { _notifyIcon.Visible = false; } catch { }
+                try { _notifyIcon.Visible = true; return; } catch { }
+            }
+            CreateTrayIcon();
+            Log("tray recreated");
+        }
+        catch (Exception ex) { Log("recreate tray failed: " + ex.Message); }
+    }
+
+    private static void RehookWinEvent()
+    {
+        try
+        {
+            if (_winEventHook != IntPtr.Zero) { UnhookWinEvent(_winEventHook); _winEventHook = IntPtr.Zero; }
+            _winEventProc = WinEventProc;
+            _winEventHook = SetWinEventHook(EVENT_OBJECT_CREATE, EVENT_OBJECT_NAMECHANGE,
+                IntPtr.Zero, _winEventProc, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+            Log(_winEventHook == IntPtr.Zero ? "rehook WinEvent failed" : "rehook WinEvent ok (resume)");
+        }
+        catch (Exception ex) { Log("rehook failed: " + ex.Message); }
+    }
+
+    private static void EnsureAutoStartTaskHealthy()
+    {
+        if (!IsAutoStartEnabled()) return;
+        try
+        {
+            var psi = new ProcessStartInfo("schtasks.exe")
+            {
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+            };
+            psi.ArgumentList.Add("/query");
+            psi.ArgumentList.Add("/tn");
+            psi.ArgumentList.Add(AutoStartTaskName);
+            psi.ArgumentList.Add("/xml");
+            using var p = Process.Start(psi);
+            if (p == null) return;
+            string xml = p.StandardOutput.ReadToEnd();
+            p.WaitForExit(5000);
+            bool bad = xml.Contains("<DisallowStartIfOnBatteries>true") ||
+                       xml.Contains("<StopIfGoingOnBatteries>true") ||
+                       xml.Contains("<StopOnIdleEnd>true") ||
+                       !xml.Contains("<ExecutionTimeLimit>PT0S");
+            if (bad)
+            {
+                Log("stale task detected (battery/idle kill); repairing");
+                SetAutoStart(true);
+                Log("task repaired");
+            }
+        }
+        catch { }
     }
 
     // ---- Auto-start with Windows (elevated, via a logon scheduled task) ----
@@ -507,6 +720,8 @@ internal static class Program
                "  <Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>" +
                "<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>" +
                "<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>" +
+               "<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>" +
+               "<IdleSettings><StopOnIdleEnd>false</StopOnIdleEnd><RestartOnIdle>false</RestartOnIdle></IdleSettings>" +
                "<StartWhenAvailable>false</StartWhenAvailable></Settings>\n" +
                $"  <Actions><Exec><Command>{cmd}</Command></Exec></Actions>\n" +
                "</Task>";
@@ -602,7 +817,7 @@ internal static class Program
         // - too brief for the 100ms/2s window poll. A dedicated tight poller samples live
         // process counts for exes we already track; a count spike stamps exeSpikeAt and the
         // main loop re-maximizes the demoted window. A genuine user Restore has no new
-        // process, so it is never triggered. ponytail: 50ms poll, only for knownExes; stops
+        // process, so it is never triggered. ponytail: 100ms poll, only for knownExes; stops
         // with the app (fire-and-forget task).
         var spikeLock = new object();
         var spikeCts = new CancellationTokenSource();
@@ -613,6 +828,11 @@ internal static class Program
         uint[] pids = new uint[1024];
         var pidNames = new Dictionary<uint, string>();
         var livePids = new HashSet<uint>();
+        var deadPids = new List<uint>();
+        // exe image name (no extension) -> live process count, rebuilt once per
+        // census tick so each knownExe is a dictionary lookup, not a full scan.
+        var liveCounts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        long lastCensusMs = 0, maxCensusMs = 0; // heartbeat diagnostics
         _ = Task.Run(async () =>
         {
             while (!spikeCts.IsCancellationRequested)
@@ -621,11 +841,12 @@ internal static class Program
                 // process census entirely and sleep, letting CPU drop to zero.
                 if (!_spikeActive)
                 {
-                    try { await Task.Delay(50, spikeCts.Token); } catch { break; }
+                    try { await Task.Delay(100, spikeCts.Token); } catch { break; }
                     continue;
                 }
                 try
                 {
+                    var censusSw = Stopwatch.StartNew();
                     // Bare pid list via EnumProcesses: no per-process object or name
                     // resolution. Replaces Process.GetProcesses(), which allocated a
                     // Process per system process and resolved every image name 20x/s.
@@ -640,7 +861,10 @@ internal static class Program
 
                     livePids.Clear();
                     for (int i = 0; i < count; i++) livePids.Add(pids[i]);
-                    foreach (var dead in pidNames.Keys.Where(k => !livePids.Contains(k)).ToList())
+                    deadPids.Clear();
+                    foreach (var kv in pidNames)
+                        if (!livePids.Contains(kv.Key)) deadPids.Add(kv.Key);
+                    foreach (var dead in deadPids)
                         pidNames.Remove(dead);
                     for (int i = 0; i < count; i++)
                     {
@@ -662,12 +886,15 @@ internal static class Program
                         if (name != null) pidNames[pid] = name;
                     }
 
+                    // One pass over pidNames builds per-image live counts; each knownExe
+                    // is then a single lookup (was a full scan of all names per exe).
+                    liveCounts.Clear();
+                    foreach (var name in pidNames.Values)
+                        liveCounts[name] = liveCounts.TryGetValue(name, out int n) ? n + 1 : 1;
                     foreach (var exe in knownExes.ToList())
                     {
                         string want = Path.GetFileNameWithoutExtension(exe);
-                        int live = 0;
-                        foreach (var kv in pidNames)
-                            if (string.Equals(kv.Value, want, StringComparison.OrdinalIgnoreCase)) live++;
+                        int live = liveCounts.TryGetValue(want, out int n) ? n : 0;
                         lock (spikeLock)
                         {
                             int baseN = exeBaseline.TryGetValue(exe, out var b) ? b : live;
@@ -675,13 +902,14 @@ internal static class Program
                             exeBaseline[exe] = Math.Max(baseN, live);
                         }
                     }
+                    lastCensusMs = censusSw.ElapsedMilliseconds;
+                    if (lastCensusMs > maxCensusMs) maxCensusMs = lastCensusMs;
                 }
                 catch { }
-                // ponytail: 50ms sampling (one scan per tick) is ~N*10 fewer table scans
-                // than the old per-exe 5ms polls; a re-launch stub shorter than ~50ms may
-                // slip through. If re-launch demotes start being missed, drop to 5ms -
-                // still one scan per tick, ~30x cheaper than the old per-exe enumeration.
-                try { await Task.Delay(50, spikeCts.Token); } catch { break; }
+                // ponytail: 100ms sampling (one scan per tick); a re-launch stub shorter
+                // than ~100ms may slip through. If re-launch demotes start being missed,
+                // drop to 50ms - still one scan per tick.
+                try { await Task.Delay(100, spikeCts.Token); } catch { break; }
             }
         }, spikeCts.Token);
         // Per window: its last observed state and when it last TRANSITIONED to
@@ -700,6 +928,10 @@ internal static class Program
         // normal state is this brief; a deliberate un-maximize keeps the window
         // normal for longer and must record as a normal close.
         var teardownGrace = TimeSpan.FromSeconds(0.65);
+        // A sibling counts as a "reopen" only while young: a long-existing
+        // same-folder window must not rescue a deliberate Restore (two same-folder
+        // windows may legitimately differ - one maximized, one normal).
+        var siblingReopenGrace = TimeSpan.FromSeconds(3.0);
         // After WSK maximizes a window (open-restore or re-assert), the app may
         // revert it to normal (e.g. re-activating an already-open single-instance
         // window drops it to normal). Re-assert maximize within this window so a
@@ -770,6 +1002,16 @@ internal static class Program
         var hwndInstance = new Dictionary<IntPtr, (string BaseKey, int Instance)>();
         int tick = 0;
         var nextFull = DateTime.MinValue;
+        // Foreground tracking to separate explicit Restore (demote while already
+        // foreground) from programmatic demote (demote while background, or becoming
+        // foreground coincident with the demote, e.g. Start-menu re-activating an
+        // already-open maximized folder). Sampled every loop iteration (~200ms when
+        // anything maximized is live), so prevFg is the foreground ~one tick ago.
+        IntPtr prevFgHwnd = IntPtr.Zero;
+        IntPtr lastFgHwnd = IntPtr.Zero;
+        // Full-pass diagnostics for the verbose heartbeat.
+        var passStart = DateTime.Now;
+        long lastPassMs = 0, maxPassMs = 0;
 
         while (true)
         {
@@ -783,9 +1025,17 @@ internal static class Program
                 // the 50ms poller sleep otherwise. Mirrors the same trigger as `fast`.
                 _spikeActive = fast;
                 // While any young window is undecided, iterate at the fast rate so its
-                // title settle / visibility race resolves promptly.
-                bool signaled = _wakeEvent?.WaitOne((fast || restoreCandidates.Count > 0 || closedAt.Count > 0 || reAppearMax.Count > 0) ? FastPollMs : FallbackPollMs) ?? false;
+                // title settle / visibility race resolves promptly. New windows pending
+                // title settle poll fastest (50ms, brief) so a folder reopen snaps
+                // ms after Explorer sets its title instead of flashing normal.
+                bool signaled = _wakeEvent?.WaitOne(restoreCandidates.Count > 0 ? 50
+                    : (fast || closedAt.Count > 0 || reAppearMax.Count > 0) ? FastPollMs : FallbackPollMs) ?? false;
                 bool fullDue = DateTime.Now >= nextFull;
+                // Sample foreground once per iteration for the demote-cause check below.
+                IntPtr fgNow = IntPtr.Zero;
+                try { fgNow = GetForegroundWindow(); } catch { }
+                prevFgHwnd = lastFgHwnd;
+                lastFgHwnd = fgNow;
 
                 // Immediate restore path: windows that just appeared are restored
                 // here, BEFORE the full snapshot pass, so they paint maximized from the
@@ -807,7 +1057,8 @@ internal static class Program
                 }
                 foreach (var hwnd in restoreCandidates.ToList())
                 {
-                    if (DateTime.Now - candidateSince[hwnd] > titleSettleWindow)
+                    if (!candidateSince.TryGetValue(hwnd, out var candSince)
+                        || DateTime.Now - candSince > titleSettleWindow)
                     { restoreCandidates.Remove(hwnd); continue; }
                     if (TryRestoreNow(hwnd, pendingCloses))
                         restoreCandidates.Add(hwnd);
@@ -869,7 +1120,29 @@ internal static class Program
                             lastStateAt[hwnd] = (true, DateTime.Now);
                         }
                         else if (!unMaximizedSince.TryGetValue(hwnd, out var since))
+                        {
                             unMaximizedSince[hwnd] = DateTime.Now;
+                            // Start-menu / taskbar re-activating the same window demotes
+                            // it while becoming foreground (never while staying
+                            // foreground - explicit Restore stays foreground). Rescue
+                            // became-foreground demotes at once; plain background
+                            // demotes wait below for a sibling (new-window reopen)
+                            // instead of fighting a background Restore. Never right
+                            // after WSK maximized (fight-back).
+                            if (intendedMaximized.Contains(hwnd) && placement.showCmd == SW_SHOWNORMAL)
+                            {
+                                bool became = hwnd == fgNow && hwnd != prevFgHwnd;
+                                bool wskRecent = lastMaxAssert.TryGetValue(hwnd, out var lma)
+                                    && DateTime.Now - lma <= reAssertGrace;
+                                if (became && !wskRecent)
+                                {
+                                    Log($"restored {hwnd:X} (maximized->normal on re-activate, intent kept)");
+                                    lastMaxAssert[hwnd] = DateTime.Now;
+                                    MaximizeNoSteal(hwnd);
+                                    unMaximizedSince.Remove(hwnd);
+                                }
+                            }
+                        }
                         else if (DateTime.Now - since > teardownGrace)
                         {
                             lastStateAt[hwnd] = (false, since); // commit the un-maximize at its start
@@ -908,6 +1181,7 @@ internal static class Program
                     continue;
                 }
 
+                passStart = DateTime.Now;
                 var current = Snapshot(previous, hwndInstance);
 
                 // Monitor configuration changed (resolution change, monitor
@@ -941,9 +1215,14 @@ internal static class Program
                 }
 
                 // Detect windows that closed; stage their state for grouping.
+                // A pid change on the same HWND value means the OS reused the handle
+                // for a new process's window: the old window closed and a new one
+                // opened. Without this the old close is never recorded and the new
+                // window looks like a continuing one, so its restore is missed.
                 foreach (var (hwnd, info) in previous)
                 {
-                    if (!current.ContainsKey(hwnd))
+                    if (!current.ContainsKey(hwnd)
+                        || (current.TryGetValue(hwnd, out var curNow) && curNow.Pid != info.Pid))
                     {
                         // The window the user last touched (latest state change)
                         // decides the close state, not "any maximized wins".
@@ -1019,11 +1298,81 @@ internal static class Program
                         // lasted past teardownGrace; the fast pass already times it via
                         // unMaximizedSince, and a single snapshot blip is ignored here.
                         if (!unMaximizedSince.TryGetValue(hwnd, out var since))
+                        {
                             unMaximizedSince[hwnd] = DateTime.Now;
+                            // Same-folder reopen demote (Start-menu / taskbar): same HWND,
+                            // same folder (BaseKey unchanged, not navigated away), normal
+                            // demote while background/became (never stayed-foreground
+                            // explicit Restore). Rescue at once unless WSK just maximized
+                            // (user fighting back). Plain background with no sibling and
+                            // no became waits below for the sibling/activation instead
+                            // of fighting a background Restore.
+                            if (intendedMaximized.Contains(hwnd) && info.ShowCmd == SW_SHOWNORMAL
+                                && previous.TryGetValue(hwnd, out var prevInfo) && prevInfo.BaseKey == info.BaseKey)
+                            {
+                                bool stayed = hwnd == fgNow && hwnd == prevFgHwnd;
+                                bool became = hwnd == fgNow && hwnd != prevFgHwnd;
+                                bool wskRecent = lastMaxAssert.TryGetValue(hwnd, out var lma)
+                                    && DateTime.Now - lma <= reAssertGrace;
+                                bool siblingRecent = false;
+                                if (!stayed && !wskRecent)
+                                {
+                                    foreach (var (oh, oinfo) in current)
+                                    {
+                                        if (oh == hwnd || oinfo.BaseKey != info.BaseKey) continue;
+                                        if (!(oinfo.Maximized || intendedMaximized.Contains(oh))) continue;
+                                        bool brandNew = !previous.ContainsKey(oh);
+                                        bool justSeen = firstSeenAt.TryGetValue(oh, out var sibSeen)
+                                            && DateTime.Now - sibSeen <= siblingReopenGrace;
+                                        if (brandNew || justSeen) { siblingRecent = true; break; }
+                                    }
+                                }
+                                if ((became || siblingRecent) && !wskRecent && !stayed)
+                                {
+                                    Log($"restored {hwnd:X} (maximized->normal on same-folder reopen, intent kept)");
+                                    lastMaxAssert[hwnd] = DateTime.Now;
+                                    MaximizeNoSteal(hwnd);
+                                    unMaximizedSince.Remove(hwnd);
+                                }
+                            }
+                        }
                         else if (DateTime.Now - since > teardownGrace)
                         {
                             lastStateAt[hwnd] = (false, since);
                             intendedMaximized.Remove(hwnd);
+                        }
+                        else if (intendedMaximized.Contains(hwnd) && info.ShowCmd == SW_SHOWNORMAL
+                            && previous.TryGetValue(hwnd, out var prevInfo2) && prevInfo2.BaseKey == info.BaseKey)
+                        {
+                            // New-after-demote / delayed-activate (within the grace, before
+                            // the sustained clear above): same-folder sibling just appeared,
+                            // or became-foreground this tick. Never for stayed-foreground
+                            // genuine Restores (which never became, and whose sibling
+                            // coincidence is ignored).
+                            bool stayed2 = hwnd == fgNow && hwnd == prevFgHwnd;
+                            bool became2 = hwnd == fgNow && hwnd != prevFgHwnd;
+                            bool wskRecent2 = lastMaxAssert.TryGetValue(hwnd, out var lma2)
+                                && DateTime.Now - lma2 <= reAssertGrace;
+                            bool siblingRecent2 = false;
+                            if (!stayed2 && !wskRecent2)
+                            {
+                                foreach (var (oh, oinfo) in current)
+                                {
+                                    if (oh == hwnd || oinfo.BaseKey != info.BaseKey) continue;
+                                    if (!(oinfo.Maximized || intendedMaximized.Contains(oh))) continue;
+                                    bool brandNew = !previous.ContainsKey(oh);
+                                    bool justSeen = firstSeenAt.TryGetValue(oh, out var sibSeen)
+                                        && DateTime.Now - sibSeen <= siblingReopenGrace;
+                                    if (brandNew || justSeen) { siblingRecent2 = true; break; }
+                                }
+                            }
+                            if ((became2 || siblingRecent2) && !wskRecent2 && !stayed2)
+                            {
+                                Log($"restored {hwnd:X} (maximized->normal on same-folder reopen, intent kept)");
+                                lastMaxAssert[hwnd] = DateTime.Now;
+                                MaximizeNoSteal(hwnd);
+                                unMaximizedSince.Remove(hwnd);
+                            }
                         }
                         if (lastMaximizedAt.TryGetValue(hwnd, out var lastMax) && DateTime.Now - lastMax > maximizeHistory)
                             lastMaximizedAt.Remove(hwnd);
@@ -1071,7 +1420,11 @@ internal static class Program
                     if (info.Maximized)
                     {
                         restoreUntil.Remove(info.Key); // already maximized, nothing to do
-                        if (!previous.ContainsKey(hwnd))
+                        // A reused HWND (new pid) showing maximized is a new window whose
+                        // app restored its own state, not a continuing one: watch for a
+                        // self-demote like any other reappearance.
+                        if (!previous.ContainsKey(hwnd)
+                            || (previous.TryGetValue(hwnd, out var prevMax) && prevMax.Pid != info.Pid))
                             reAppearMax[hwnd] = DateTime.Now; // reappeared max; watch for self-demote
                         continue;
                     }
@@ -1123,6 +1476,7 @@ internal static class Program
                     // yet, cloak at show, dropped event) and would otherwise leave
                     // the window normal forever despite the record saying maximized.
                     else if ((!previous.ContainsKey(hwnd)
+                            || (previous.TryGetValue(hwnd, out var prevNew) && prevNew.Pid != info.Pid)
                             || (previous[hwnd].Key != info.Key && firstSeenAt.TryGetValue(hwnd, out var firstSeen)
                                 && DateTime.Now - firstSeen <= titleSettleWindow)
                             || (closedAt.TryGetValue(hwnd, out var closedWhen) && DateTime.Now - closedWhen <= reopenGrace
@@ -1166,18 +1520,41 @@ internal static class Program
                 foreach (var k in lastRestoreTry.Keys.ToList())
                     if (!restoreUntil.ContainsKey(k))
                         lastRestoreTry.Remove(k);
+                // lastMaxAssert: every read is gated by reAssertGrace, so entries older
+                // than that can never fire - drop them instead of growing forever.
+                foreach (var h in lastMaxAssert.Keys.ToList())
+                    if (DateTime.Now - lastMaxAssert[h] > reAssertGrace)
+                        lastMaxAssert.Remove(h);
+                // candidateSince: entries for windows neither live nor being watched
+                // (created and destroyed between full passes) would otherwise leak.
+                foreach (var h in candidateSince.Keys.ToList())
+                    if (!restoreCandidates.Contains(h) && !current.ContainsKey(h))
+                        candidateSince.Remove(h);
 
                 // Schedule the next full pass here (not at the top): the counts for
                 // closedAt/reAppearMax updated during THIS pass must decide the
                 // cadence of the NEXT pass, so a window that just reappeared (max or
                 // recently closed) is re-polled in a quarter second, not up to 2s.
+                // A demote pending intent (unMaximized + intended overlap, brief 0.65s
+                // window) also needs the fast cadence so a same-folder sibling or
+                // delayed activation arriving ~500ms after the demote is seen before
+                // the sustained clear. New windows pending restore (candidates) need
+                // it too, otherwise a rapid 2nd/3rd reopen waits the 2s fallback for
+                // its sibling to appear in the snapshot (the "wait 3s" effect).
+                bool demotePending = false;
+                foreach (var h in unMaximizedSince.Keys)
+                    if (intendedMaximized.Contains(h)) { demotePending = true; break; }
                 nextFull = DateTime.Now.AddMilliseconds(
-                    (closedAt.Count > 0 || reAppearMax.Count > 0) ? ReopenPollMs : FallbackPollMs);
+                    (closedAt.Count > 0 || reAppearMax.Count > 0 || demotePending || restoreCandidates.Count > 0) ? ReopenPollMs : FallbackPollMs);
 
                 // Routine heartbeat: only in --verbose mode, so the log stays
                 // event-only (and small) during normal use.
+                lastPassMs = (long)(DateTime.Now - passStart).TotalMilliseconds;
+                if (lastPassMs > maxPassMs) maxPassMs = lastPassMs;
                 if (++tick % 30 == 0 && verbose)
-                    Log($"tick windows={current.Count} restorePending={restoreUntil.Count}");
+                    Log($"tick windows={current.Count} restorePending={restoreUntil.Count} " +
+                        $"passMs={lastPassMs}/max{maxPassMs} censusMs={lastCensusMs}/max{maxCensusMs} " +
+                        $"heapMb={GC.GetTotalMemory(false) / (1024 * 1024)}");
             }
             catch (Exception ex)
             {
@@ -1251,10 +1628,45 @@ internal static class Program
                 else
                 {
                     var rec = RecordState(key);
-                    if (rec < 0) return true; // no record yet: the title may still settle into a recorded key
+                    if (rec < 0)
+                    {
+                        // No record: a same-folder sibling that is currently maximized
+                        // (or wants to be) still means "open maximized" (mirrors the
+                        // full pass sibling rule). Otherwise the title may still settle
+                        // into a recorded key, so keep watching.
+                        var baseKey = BuildBaseKey(exe, cls, title);
+                        foreach (var (oh, oinfo) in previous)
+                        {
+                            if (oh == hwnd || oinfo.BaseKey != baseKey) continue;
+                            if (oinfo.Maximized || intendedMaximized.Contains(oh))
+                            {
+                                Log($"restored {hwnd:X} {key} (immediate, sibling maximized)");
+                                lastMaxAssert[hwnd] = DateTime.Now;
+                                MaximizeNoSteal(hwnd);
+                                return false;
+                            }
+                        }
+                        return true;
+                    }
                     shouldRestore = rec == 1;
                 }
-                if (!shouldRestore) return false;
+                if (!shouldRestore)
+                {
+                    // Record says normal: still honor a live maximized sibling of the
+                    // same folder (maximize -> reopen must stay maximized even though
+                    // the folder was never closed maximized to write a record).
+                    var baseKey = BuildBaseKey(exe, cls, title);
+                    foreach (var (oh, oinfo) in previous)
+                    {
+                        if (oh == hwnd || oinfo.BaseKey != baseKey) continue;
+                        if (oinfo.Maximized || intendedMaximized.Contains(oh))
+                        {
+                            shouldRestore = true;
+                            break;
+                        }
+                    }
+                    if (!shouldRestore) return false;
+                }
                 Log($"restored {hwnd:X} {key} (immediate)");
                 lastMaxAssert[hwnd] = DateTime.Now;
                 MaximizeNoSteal(hwnd);
@@ -1290,8 +1702,14 @@ internal static class Program
     private static Dictionary<IntPtr, WinInfo> Snapshot(Dictionary<IntPtr, WinInfo> previous,
         Dictionary<IntPtr, (string BaseKey, int Instance)> hwndInstance)
     {
-        var result = new Dictionary<IntPtr, WinInfo>();
         uint selfPid = (uint)Environment.ProcessId;
+
+        // Phase 1: enumerate live windows WITHOUT assigning instances. Assignment
+        // needs the full live set first: a window that closed since the last pass
+        // must free its slot before a reopened window claims one, or a fast
+        // close+reopen within one poll interval lands on |#2 and misses its |#1
+        // record (random "forgot" misses).
+        var entries = new List<(IntPtr Hwnd, uint Pid, string Exe, string Class, string Title, string BaseKey, bool Maximized, int ShowCmd)>();
 
         EnumWindows((hwnd, _) =>
         {
@@ -1327,35 +1745,87 @@ internal static class Program
             // A transient empty title read (SendMessageTimeout timing out on a busy
             // thread) must not collapse the window onto the shared exe|class key: that
             // would merge it with unrelated windows (and their records). Keep the last
-            // non-empty title we saw for this window instead.
+            // non-empty title we saw for this window instead. Pid-gated so an HWND
+            // value reused by a new process never inherits the old title.
             if (title.Length == 0 && prev != null && prev.Pid == pid && prev.Title.Length > 0)
                 title = prev.Title;
-            result[hwnd] = new WinInfo
-            {
-                Pid = pid,
-                Exe = exe,
-                Class = cls,
-                Title = title,
-                Maximized = maximized,
-                ShowCmd = showCmd,
-                Instance = AssignInstance(hwnd, BuildBaseKey(exe, cls, title), hwndInstance),
-            };
+            entries.Add((hwnd, pid, exe, cls, title, BuildBaseKey(exe, cls, title), maximized, showCmd));
             return true;
         }, IntPtr.Zero);
+
+        // Phase 2: free slots of windows that are gone before assigning, so a
+        // reopened window reclaims its freed slot instead of drifting to |#2.
+        var live = new HashSet<IntPtr>(entries.Select(e => e.Hwnd));
+        foreach (var h in hwndInstance.Keys.ToList())
+            if (!live.Contains(h))
+                hwndInstance.Remove(h);
+
+        // Phase 3: assign. Windows continuing from the last pass keep their slot
+        // (stable across z-order churn); new or retitled windows take the smallest
+        // free slot among live siblings. The immediate path's provisional assignment
+        // (made while a dead sibling still occupied its slot) is overridden here for
+        // windows not in `previous`, so the full pass is authoritative.
+        var takenByBase = new Dictionary<string, HashSet<int>>(StringComparer.Ordinal);
+        foreach (var e in entries)
+        {
+            if (previous.ContainsKey(e.Hwnd)
+                && hwndInstance.TryGetValue(e.Hwnd, out var cur)
+                && cur.BaseKey == e.BaseKey)
+            {
+                if (!takenByBase.TryGetValue(e.BaseKey, out var s))
+                    takenByBase[e.BaseKey] = s = new HashSet<int>();
+                s.Add(cur.Instance);
+            }
+        }
+        var result = new Dictionary<IntPtr, WinInfo>();
+        foreach (var e in entries)
+        {
+            int instance;
+            if (previous.ContainsKey(e.Hwnd)
+                && hwndInstance.TryGetValue(e.Hwnd, out var cur)
+                && cur.BaseKey == e.BaseKey)
+            {
+                instance = cur.Instance;
+            }
+            else
+            {
+                if (!takenByBase.TryGetValue(e.BaseKey, out var taken))
+                    takenByBase[e.BaseKey] = taken = new HashSet<int>();
+                instance = 1;
+                while (taken.Contains(instance)) instance++;
+                taken.Add(instance);
+            }
+            hwndInstance[e.Hwnd] = (e.BaseKey, instance);
+            result[e.Hwnd] = new WinInfo
+            {
+                Pid = e.Pid,
+                Exe = e.Exe,
+                Class = e.Class,
+                Title = e.Title,
+                Maximized = e.Maximized,
+                ShowCmd = e.ShowCmd,
+                Instance = instance,
+            };
+        }
 
         return result;
     }
 
     private static string GetProcessName(uint pid)
     {
+        IntPtr hProcess = OpenProcess(PROC_QUERY_LIMITED_INFO, false, pid);
+        if (hProcess == IntPtr.Zero) return "unknown.exe";
         try
         {
-            using var p = Process.GetProcessById((int)pid);
-            return p.ProcessName + ".exe";
+            var sb = new StringBuilder(260);
+            uint size = (uint)sb.Capacity;
+            if (QueryFullProcessImageName(hProcess, 0, sb, ref size))
+                return Path.GetFileName(sb.ToString());
+            return "unknown.exe";
         }
-        catch
+        finally
         {
-            return "unknown.exe"; // process already gone or not accessible
+            CloseHandle(hProcess);
         }
     }
 
@@ -1380,11 +1850,37 @@ internal static class Program
         return Convert.ToHexString(SHA1.HashData(Encoding.UTF8.GetBytes(key))).ToLowerInvariant();
     }
 
+    // Cached read handle: RecordState runs on every restore check (hot while a
+    // window title settles), and OpenSubKey per call was the hot path. Opened
+    // lazily on first read; the app is RegRoot's only writer and never deletes
+    // it, so the handle stays valid for the process lifetime. Any failure falls
+    // back to one fresh open. Read only from the watcher thread.
+    private static RegistryKey? _regRead;
+
     // 1 = record says maximized, 0 = record says normal, -1 = no record.
     private static int RecordState(string key)
     {
-        using var keyHandle = Registry.CurrentUser.OpenSubKey(RegRoot);
-        return keyHandle?.GetValue(RegValueName(key)) is int v ? v : -1;
+        try
+        {
+            if (_regRead == null)
+            {
+                _regRead = Registry.CurrentUser.OpenSubKey(RegRoot);
+                if (_regRead == null) return -1; // no key yet: no records exist
+            }
+            return _regRead.GetValue(RegValueName(key)) is int v ? v : -1;
+        }
+        catch
+        {
+            // key deleted underneath us or hive hiccup: drop the cache, try once fresh.
+            try { _regRead?.Dispose(); } catch { }
+            _regRead = null;
+            try
+            {
+                using var fresh = Registry.CurrentUser.OpenSubKey(RegRoot);
+                return fresh?.GetValue(RegValueName(key)) is int v ? v : -1;
+            }
+            catch { return -1; }
+        }
     }
 
     private static bool WasClosedMaximized(string key)
@@ -1527,7 +2023,9 @@ internal static class Program
                         var text = File.ReadAllText(_logPath);
                         int cut = text.IndexOf('\n', text.Length / 2);
                         if (cut > 0) text = text[(cut + 1)..];
-                        File.WriteAllText(_logPath, text);
+                        string tmp = _logPath + ".tmp";
+                        File.WriteAllText(tmp, text);
+                        File.Move(tmp, _logPath, true);
                     }
                     File.AppendAllText(_logPath, $"[{DateTime.Now:HH:mm:ss}] {line}{Environment.NewLine}");
                 }

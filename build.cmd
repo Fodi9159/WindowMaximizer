@@ -8,5 +8,5 @@ if errorlevel 1 (
     exit /b 1
 )
 echo.
-echo Build OK: %~dp0WindowMaximizer\bin\Release\net8.0-windows\WindowMaximizer.exe
-explorer "%~dp0WindowMaximizer\bin\Release\net8.0-windows"
+echo Build OK: %~dp0WindowMaximizer\bin\Release\net10.0-windows\WindowMaximizer.exe
+explorer "%~dp0WindowMaximizer\bin\Release\net10.0-windows"
