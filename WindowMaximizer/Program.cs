@@ -11,7 +11,8 @@ using System.Windows.Forms;
 using Microsoft.Win32;
 
 // WindowMaximizer: remembers whether each top-level window was closed
-// maximized, and re-maximizes it the next time it opens. Works for classic
+// maximized, and re-maximizes it the next time it opens; windows closed
+// normal reopen with their saved position/size. Works for classic
 // Win32 windows and UWP apps (ApplicationFrameHost frame windows).
 //
 // Runs in the system tray. Right-click the icon for the menu: "Start with
@@ -59,6 +60,15 @@ internal static class Program
     [DllImport("user32.dll")]
     private static extern bool SetWindowPlacement(IntPtr hWnd, ref WINDOWPLACEMENT lpwndpl);
 
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter,
+        int X, int Y, int cx, int cy, uint uFlags);
+
+    private const uint SWP_NOSIZE = 0x0001;
+    private const uint SWP_NOZORDER = 0x0004;
+    private const uint SWP_NOACTIVATE = 0x0010;
+    private const uint SWP_ASYNCWINDOWPOS = 0x4000;
+
     [DllImport("user32.dll")]
     private static extern IntPtr GetForegroundWindow();
 
@@ -77,6 +87,19 @@ internal static class Program
 
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
     private static extern uint RegisterWindowMessage(string lpString);
+
+    [DllImport("dwmapi.dll")]
+    private static extern int DwmSetWindowAttribute(IntPtr hwnd, int dwAttribute, ref int pvAttribute, int cbAttribute);
+
+    [DllImport("uxtheme.dll", CharSet = CharSet.Unicode)]
+    private static extern int SetWindowTheme(IntPtr hwnd, string? pszSubAppName, string? pszSubIdList);
+
+    private const int DWMWA_USE_IMMERSIVE_DARK_MODE = 20;
+    private const int DWMWA_WINDOW_CORNER_PREFERENCE = 33;
+    private const int DWMWCP_ROUND = 2;
+    private const int DWMWA_SYSTEMBACKDROP_TYPE = 38;
+    private const int DWMSBT_TRANSIENTWINDOW = 3;
+    private const int WM_SETTINGCHANGE = 0x001A;
 
     // Cheap process census for the re-launch poller (see WatcherLoop): EnumProcesses
     // returns a bare pid list (~microseconds); names are resolved once per pid.
@@ -175,6 +198,7 @@ internal static class Program
         public required string Title;
         public required bool Maximized;
         public required int ShowCmd;
+        public required RECT NormalBounds;
         // Per-window disambiguation: the first live window of a base key is instance
         // 1 (plain key), the second 2, etc. Assigned when the window is first seen
         // and kept until it closes, so z-order churn never swaps identities. A closed
@@ -208,6 +232,16 @@ internal static class Program
         "Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd", "Shell_DwmTabWindow",
     };
 
+    // Standard Win32 dialogs build their children asynchronously during
+    // WM_INITDIALOG (e.g. cleanmgr's "Disk Cleanup for (C:)" populates its file
+    // list while scanning). Resizing one mid-init breaks child creation and
+    // leaves the dialog blank, so dialogs get a move-only position restore
+    // (no WM_SIZE, no re-layout) instead of a full bounds restore. The
+    // maximized path still applies (dialogs are almost never maximized, and
+    // a maximized record on one means the user explicitly put it there).
+    private static bool IsDialogClass(string cls) =>
+        cls.Equals("#32770", StringComparison.Ordinal);
+
     private static NotifyIcon? _notifyIcon;
     private static Icon? _trayIcon;
     private static AutoResetEvent? _wakeEvent;
@@ -231,6 +265,13 @@ internal static class Program
     [STAThread]
     private static int Main(string[] args)
     {
+        // Windows 11 Fluent baseline: visual styles + per-monitor DPI so the
+        // tray menu renders with the modern theme, Segoe UI Variable, and
+        // crisp scaling. Must run before any handle is created.
+        try { Application.SetHighDpiMode(HighDpiMode.PerMonitorV2); } catch { }
+        try { Application.EnableVisualStyles(); } catch { }
+        try { Application.SetCompatibleTextRenderingDefault(false); } catch { }
+
         bool verbose = args.Contains("--verbose");
 
         // Headless autostart control (also used by the tray menu, same code path):
@@ -332,6 +373,14 @@ internal static class Program
             };
             SystemEvents.SessionEnding += (s, e) => Log($"session ending {e.Reason}");
             SystemEvents.SessionSwitch += (s, e) => Log($"session switch {e.Reason}");
+            // Fires when the Windows light/dark mode changes (ImmersiveColorSet).
+            SystemEvents.UserPreferenceChanged += (s, e) =>
+            {
+                if (e.Category == UserPreferenceCategory.General)
+                {
+                    try { OnSystemThemeMaybeChanged(); } catch { }
+                }
+            };
         }
         catch (Exception ex) { Log("SystemEvents hook failed: " + ex.Message); }
 
@@ -392,13 +441,42 @@ internal static class Program
         };
         adminItem.Click += (_, _) => RestartElevated();
 
+        // Theme submenu: System (follow Windows) is the default; Light/Dark override.
+        var themeItem = new ToolStripMenuItem("Theme")
+        {
+            ToolTipText = "System follows Windows Settings > Personalization > Colors",
+        };
+        var systemItem = new ToolStripMenuItem("System (follow Windows)");
+        var lightItem = new ToolStripMenuItem("Light");
+        var darkItem = new ToolStripMenuItem("Dark");
+        var current = GetThemeMode();
+        systemItem.Checked = current == ThemeMode.System;
+        lightItem.Checked = current == ThemeMode.Light;
+        darkItem.Checked = current == ThemeMode.Dark;
+        void SelectTheme(ThemeMode mode)
+        {
+            SetThemeMode(mode);
+            systemItem.Checked = mode == ThemeMode.System;
+            lightItem.Checked = mode == ThemeMode.Light;
+            darkItem.Checked = mode == ThemeMode.Dark;
+            ApplyThemeToMenu(menu, IsDarkEffective());
+        }
+        systemItem.Click += (_, _) => SelectTheme(ThemeMode.System);
+        lightItem.Click += (_, _) => SelectTheme(ThemeMode.Light);
+        darkItem.Click += (_, _) => SelectTheme(ThemeMode.Dark);
+        themeItem.DropDownItems.Add(systemItem);
+        themeItem.DropDownItems.Add(lightItem);
+        themeItem.DropDownItems.Add(darkItem);
+
         var exitItem = new ToolStripMenuItem("Exit");
         exitItem.Click += (_, _) => Application.Exit();
 
         menu.Items.Add(startItem);
         menu.Items.Add(adminItem);
+        menu.Items.Add(themeItem);
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(exitItem);
+        ApplyThemeToMenu(menu, IsDarkEffective());
         return menu;
     }
 
@@ -461,6 +539,12 @@ internal static class Program
                 _displayChanged = true;
                 _wakeEvent?.Set();
             }
+            else if (m.Msg == WM_SETTINGCHANGE)
+            {
+                // Broadcast when Settings > Personalization > Colors changes
+                // ("ImmersiveColorSet"): re-evaluate the follow-Windows theme.
+                try { OnSystemThemeMaybeChanged(); } catch { }
+            }
             else if (_wmTaskbarCreated != 0 && m.Msg == (int)_wmTaskbarCreated)
             {
                 Log("TaskbarCreated received (Explorer restarted); recreating tray icon (filter)");
@@ -494,6 +578,10 @@ internal static class Program
                 _displayChanged = true;
                 _wakeEvent?.Set();
             }
+            else if (m.Msg == WM_SETTINGCHANGE)
+            {
+                try { OnSystemThemeMaybeChanged(); } catch { }
+            }
             base.WndProc(ref m);
         }
         protected override void SetVisibleCore(bool value) { if (!IsHandleCreated) base.SetVisibleCore(false); else base.SetVisibleCore(value); }
@@ -524,6 +612,10 @@ internal static class Program
             {
                 _displayChanged = true;
                 _wakeEvent?.Set();
+            }
+            else if (m.Msg == WM_SETTINGCHANGE)
+            {
+                try { OnSystemThemeMaybeChanged(); } catch { }
             }
             base.WndProc(ref m);
         }
@@ -624,6 +716,407 @@ internal static class Program
             Log(_winEventHook == IntPtr.Zero ? "rehook WinEvent failed" : "rehook WinEvent ok (resume)");
         }
         catch (Exception ex) { Log("rehook failed: " + ex.Message); }
+    }
+
+    // ---- Theme (follow Windows + manual override) ----
+    //
+    // ThemeMode.System (default) reads HKCU\...\Personalize\AppsUseLightTheme
+    // (0 = dark, 1 = light) so the tray menu matches Settings > Personalization
+    // > Colors > "Choose your mode". Light/Dark override it. Stored as a plain
+    // "ThemeMode" string value under RegRoot (window records use 40-char hex
+    // digest names, so there is no collision).
+
+    private enum ThemeMode { System, Light, Dark }
+
+    private const string ThemeValueName = "ThemeMode";
+    private const string PersonalizeKeyPath = @"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize";
+
+    private static ThemeMode GetThemeMode()
+    {
+        try
+        {
+            using var key = Registry.CurrentUser.OpenSubKey(RegRoot);
+            var raw = key?.GetValue(ThemeValueName) as string;
+            if (Enum.TryParse<ThemeMode>(raw, ignoreCase: true, out var mode)
+                && Enum.IsDefined(typeof(ThemeMode), mode))
+                return mode;
+        }
+        catch { }
+        return ThemeMode.System;
+    }
+
+    private static void SetThemeMode(ThemeMode mode)
+    {
+        try
+        {
+            using var key = Registry.CurrentUser.CreateSubKey(RegRoot);
+            key.SetValue(ThemeValueName, mode.ToString(), RegistryValueKind.String);
+            // Drop the cached read handle: RecordState caches RegRoot and only
+            // expects DWORD hash values; reopen so a stale handle never hides
+            // the new string value (and vice versa).
+            try { _regRead?.Dispose(); } catch { }
+            _regRead = null;
+            Log($"theme -> {mode} (effective {(IsDarkEffective() ? "dark" : "light")})");
+        }
+        catch (Exception ex) { Log("theme save failed: " + ex.Message); }
+    }
+
+    private static bool IsSystemDark()
+    {
+        try
+        {
+            using var key = Registry.CurrentUser.OpenSubKey(PersonalizeKeyPath);
+            var v = key?.GetValue("AppsUseLightTheme");
+            if (v is int i) return i == 0;
+        }
+        catch { }
+        return false; // missing key = light
+    }
+
+    private static bool IsDarkEffective()
+    {
+        var mode = GetThemeMode();
+        return mode == ThemeMode.Dark || (mode == ThemeMode.System && IsSystemDark());
+    }
+
+    private static void OnSystemThemeMaybeChanged()
+    {
+        try
+        {
+            // Manual Light/Dark never follows Windows; nothing to refresh.
+            if (GetThemeMode() != ThemeMode.System) return;
+            if (_hiddenForm != null && _hiddenForm.InvokeRequired)
+            {
+                try { _hiddenForm.BeginInvoke(new Action(OnSystemThemeMaybeChanged)); } catch { }
+                return;
+            }
+            RefreshTheme();
+        }
+        catch { }
+    }
+
+    private static void RefreshTheme()
+    {
+        try
+        {
+            var menu = _notifyIcon?.ContextMenuStrip;
+            if (menu == null) return;
+            ApplyThemeToMenu(menu, IsDarkEffective());
+        }
+        catch { }
+    }
+
+    private static Font? _fluentFont;
+
+    private static Font FluentFont()
+    {
+        if (_fluentFont != null) return _fluentFont;
+        foreach (var name in new[] { "Segoe UI Variable Text", "Segoe UI Variable", "Segoe UI" })
+        {
+            try { _fluentFont = new Font(name, 9f, FontStyle.Regular, GraphicsUnit.Point); break; }
+            catch { }
+        }
+        _fluentFont ??= SystemFonts.MenuFont ?? new Font("Segoe UI", 9f);
+        return _fluentFont;
+    }
+
+    private static System.Drawing.Drawing2D.GraphicsPath RoundedRect(Rectangle r, int radius)
+    {
+        int d = Math.Max(2, radius * 2);
+        if (d > r.Width) d = r.Width;
+        if (d > r.Height) d = r.Height;
+        var p = new System.Drawing.Drawing2D.GraphicsPath();
+        p.AddArc(r.X, r.Y, d, d, 180, 90);
+        p.AddArc(r.Right - d, r.Y, d, d, 270, 90);
+        p.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90);
+        p.AddArc(r.X, r.Bottom - d, d, d, 90, 90);
+        p.CloseFigure();
+        return p;
+    }
+
+    private static void ApplyThemeToMenu(ContextMenuStrip menu, bool dark)
+    {
+        try
+        {
+            try { (menu.Renderer as IDisposable)?.Dispose(); } catch { }
+            Color bg = dark ? Color.FromArgb(45, 45, 45) : Color.FromArgb(249, 249, 249);
+            Color fg = dark ? Color.White : Color.FromArgb(27, 27, 27);
+            menu.Renderer = new FluentMenuRenderer(dark);
+            menu.BackColor = bg;
+            menu.ForeColor = fg;
+            menu.Font = FluentFont();
+            menu.Padding = new Padding(4);
+            try { menu.ShowImageMargin = false; } catch { }
+            try { menu.ShowCheckMargin = true; } catch { }
+            foreach (ToolStripItem item in menu.Items)
+                ApplyThemeToItem(item, dark);
+            // Round corners + Mica + immersive dark frame for the popup.
+            ApplyFluentChrome(menu, dark);
+            foreach (ToolStripItem item in menu.Items)
+                if (item is ToolStripMenuItem mi && mi.HasDropDownItems)
+                    StyleDropDown(mi.DropDown, dark);
+        }
+        catch { }
+    }
+
+    private static void StyleDropDown(ToolStripDropDown dropDown, bool dark)
+    {
+        try
+        {
+            Color bg = dark ? Color.FromArgb(45, 45, 45) : Color.FromArgb(249, 249, 249);
+            Color fg = dark ? Color.White : Color.FromArgb(27, 27, 27);
+            dropDown.BackColor = bg;
+            dropDown.ForeColor = fg;
+            dropDown.Font = FluentFont();
+            dropDown.Padding = new Padding(4);
+            try
+            {
+                if (dropDown is ToolStripDropDownMenu m)
+                {
+                    m.ShowImageMargin = false;
+                    m.ShowCheckMargin = true;
+                }
+            }
+            catch { }
+            foreach (ToolStripItem sub in dropDown.Items)
+                ApplyThemeToItem(sub, dark);
+        }
+        catch { }
+        ApplyFluentChrome(dropDown, dark);
+    }
+
+    private static void ApplyThemeToItem(ToolStripItem item, bool dark)
+    {
+        try
+        {
+            Color bg = dark ? Color.FromArgb(45, 45, 45) : Color.FromArgb(249, 249, 249);
+            Color fg = dark ? Color.White : Color.FromArgb(27, 27, 27);
+            Color disabled = dark ? Color.FromArgb(160, 160, 160) : SystemColors.GrayText;
+            if (item is ToolStripSeparator) return; // drawn by the renderer
+            item.BackColor = bg;
+            item.ForeColor = !item.Enabled ? disabled : fg;
+            item.Font = FluentFont();
+            try { item.Padding = new Padding(10, 5, 10, 5); } catch { }
+            try { item.Margin = new Padding(0); } catch { }
+            if (item is ToolStripMenuItem mi)
+            {
+                foreach (ToolStripItem sub in mi.DropDownItems)
+                    ApplyThemeToItem(sub, dark);
+                StyleDropDown(mi.DropDown, dark);
+            }
+        }
+        catch { }
+    }
+
+    private static void ApplyFluentChrome(ToolStripDropDown dropDown, bool dark)
+    {
+        void Apply()
+        {
+            try
+            {
+                if (!dropDown.IsHandleCreated) return;
+                int useDark = dark ? 1 : 0;
+                try { DwmSetWindowAttribute(dropDown.Handle, DWMWA_USE_IMMERSIVE_DARK_MODE, ref useDark, sizeof(int)); } catch { }
+                try
+                {
+                    int corner = DWMWCP_ROUND;
+                    DwmSetWindowAttribute(dropDown.Handle, DWMWA_WINDOW_CORNER_PREFERENCE, ref corner, sizeof(int));
+                }
+                catch { }
+                try
+                {
+                    int backdrop = DWMSBT_TRANSIENTWINDOW;
+                    DwmSetWindowAttribute(dropDown.Handle, DWMWA_SYSTEMBACKDROP_TYPE, ref backdrop, sizeof(int));
+                }
+                catch { } // Win10: attribute unknown, ignore
+                try { SetWindowTheme(dropDown.Handle, dark ? "DarkMode_Explorer" : null, null); } catch { }
+            }
+            catch { }
+        }
+        try
+        {
+            if (dropDown.IsHandleCreated)
+                Apply();
+            else
+            {
+                void Handler(object? s, EventArgs e)
+                {
+                    try { dropDown.HandleCreated -= Handler; } catch { }
+                    Apply();
+                }
+                dropDown.HandleCreated -= Handler;
+                dropDown.HandleCreated += Handler;
+            }
+        }
+        catch { }
+    }
+
+    private static void ApplyImmersiveDarkMode(ToolStripDropDown dropDown, bool dark) =>
+        ApplyFluentChrome(dropDown, dark);
+
+    private sealed class FluentColorTable : ProfessionalColorTable
+    {
+        private readonly bool _dark;
+        public FluentColorTable(bool dark) { _dark = dark; }
+        private Color Bg => _dark ? Color.FromArgb(45, 45, 45) : Color.FromArgb(249, 249, 249);
+        private Color Hover => _dark ? Color.FromArgb(62, 62, 62) : Color.FromArgb(234, 234, 234);
+        private Color Border => _dark ? Color.FromArgb(68, 68, 68) : Color.FromArgb(219, 219, 219);
+        private Color Sep => _dark ? Color.FromArgb(70, 70, 70) : Color.FromArgb(224, 224, 224);
+        public override Color ToolStripDropDownBackground => Bg;
+        public override Color MenuItemSelected => Hover;
+        public override Color MenuItemSelectedGradientBegin => Hover;
+        public override Color MenuItemSelectedGradientEnd => Hover;
+        public override Color MenuItemPressedGradientBegin => Hover;
+        public override Color MenuItemPressedGradientMiddle => Hover;
+        public override Color MenuItemPressedGradientEnd => Hover;
+        public override Color MenuItemBorder => Color.Transparent;
+        public override Color MenuBorder => Border;
+        public override Color ToolStripBorder => Color.Transparent;
+        public override Color ImageMarginGradientBegin => Bg;
+        public override Color ImageMarginGradientMiddle => Bg;
+        public override Color ImageMarginGradientEnd => Bg;
+        public override Color CheckBackground => Color.Transparent;
+        public override Color CheckSelectedBackground => Color.Transparent;
+        public override Color CheckPressedBackground => Color.Transparent;
+        public override Color SeparatorDark => Sep;
+        public override Color SeparatorLight => Sep;
+        public override Color ButtonSelectedGradientBegin => Hover;
+        public override Color ButtonSelectedGradientMiddle => Hover;
+        public override Color ButtonSelectedGradientEnd => Hover;
+        public override Color ButtonPressedGradientBegin => Hover;
+        public override Color ButtonPressedGradientMiddle => Hover;
+        public override Color ButtonPressedGradientEnd => Hover;
+        public override Color GripDark => Border;
+        public override Color GripLight => Border;
+        public override Color OverflowButtonGradientBegin => Bg;
+        public override Color OverflowButtonGradientMiddle => Bg;
+        public override Color OverflowButtonGradientEnd => Bg;
+        public override Color ToolStripGradientBegin => Bg;
+        public override Color ToolStripGradientMiddle => Bg;
+        public override Color ToolStripGradientEnd => Bg;
+        public override Color StatusStripGradientBegin => Bg;
+        public override Color StatusStripGradientEnd => Bg;
+    }
+
+    private sealed class FluentMenuRenderer : ToolStripProfessionalRenderer
+    {
+        private readonly bool _dark;
+        public FluentMenuRenderer(bool dark) : base(new FluentColorTable(dark)) { _dark = dark; RoundedEdges = true; }
+        private Color Bg => _dark ? Color.FromArgb(45, 45, 45) : Color.FromArgb(249, 249, 249);
+        private Color Hover => _dark ? Color.FromArgb(62, 62, 62) : Color.FromArgb(234, 234, 234);
+        private Color Text => _dark ? Color.White : Color.FromArgb(27, 27, 27);
+        private Color Disabled => _dark ? Color.FromArgb(160, 160, 160) : SystemColors.GrayText;
+        private Color Sep => _dark ? Color.FromArgb(70, 70, 70) : Color.FromArgb(224, 224, 224);
+
+        protected override void OnRenderToolStripBackground(ToolStripRenderEventArgs e)
+        {
+            try
+            {
+                using var b = new SolidBrush(Bg);
+                e.Graphics.FillRectangle(b, e.AffectedBounds);
+            }
+            catch { base.OnRenderToolStripBackground(e); }
+        }
+
+        protected override void OnRenderToolStripBorder(ToolStripRenderEventArgs e)
+        {
+            // Let DWM draw the rounded Win11 border; suppress the square one.
+        }
+
+        protected override void OnRenderImageMargin(ToolStripRenderEventArgs e)
+        {
+            // No gutter divider in the Win11 language (ShowImageMargin=false anyway).
+        }
+
+        protected override void OnRenderMenuItemBackground(ToolStripItemRenderEventArgs e)
+        {
+            try
+            {
+                if (!e.Item.Enabled) return;
+                bool selected = e.Item.Selected ||
+                    (e.Item is ToolStripMenuItem mi && mi.DropDown.Visible);
+                if (!selected) return;
+                var rect = new Rectangle(4, 1, Math.Max(0, e.Item.Width - 8), Math.Max(0, e.Item.Height - 2));
+                if (rect.Width <= 0 || rect.Height <= 0) return;
+                e.Graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+                using var path = RoundedRect(rect, 4);
+                using var brush = new SolidBrush(Hover);
+                e.Graphics.FillPath(brush, path);
+            }
+            catch { base.OnRenderMenuItemBackground(e); }
+        }
+
+        protected override void OnRenderItemText(ToolStripItemTextRenderEventArgs e)
+        {
+            e.TextColor = !e.Item.Enabled ? Disabled : Text;
+            e.TextFont = FluentFont();
+            base.OnRenderItemText(e);
+        }
+
+        protected override void OnRenderItemCheck(ToolStripItemImageRenderEventArgs e)
+        {
+            // Fluent check: glyph only, no box. Drawn centered in the check area.
+            try
+            {
+                var rc = e.ImageRectangle;
+                if (rc.Width <= 0 || rc.Height <= 0)
+                    rc = new Rectangle(10, e.Item.Height / 2 - 6, 12, 12);
+                float cx = rc.X + rc.Width / 2f;
+                float cy = rc.Y + rc.Height / 2f;
+                using var pen = new Pen(!e.Item.Enabled ? Disabled : Text, 1.8f)
+                {
+                    StartCap = System.Drawing.Drawing2D.LineCap.Round,
+                    EndCap = System.Drawing.Drawing2D.LineCap.Round,
+                    LineJoin = System.Drawing.Drawing2D.LineJoin.Round,
+                };
+                e.Graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+                e.Graphics.DrawLines(pen, new[]
+                {
+                    new PointF(cx - 4.5f, cy + 0.5f),
+                    new PointF(cx - 1f, cy + 3.5f),
+                    new PointF(cx + 5f, cy - 4f),
+                });
+            }
+            catch { base.OnRenderItemCheck(e); }
+        }
+
+        protected override void OnRenderArrow(ToolStripArrowRenderEventArgs e)
+        {
+            // Fluent chevron ">" instead of the WinForms triangle.
+            try
+            {
+                var rc = e.ArrowRectangle;
+                float cx = rc.X + rc.Width / 2f;
+                float cy = rc.Y + rc.Height / 2f;
+                using var pen = new Pen((e.Item?.Enabled ?? true) ? Text : Disabled, 1.6f)
+                {
+                    StartCap = System.Drawing.Drawing2D.LineCap.Round,
+                    EndCap = System.Drawing.Drawing2D.LineCap.Round,
+                    LineJoin = System.Drawing.Drawing2D.LineJoin.Round,
+                };
+                e.Graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+                e.Graphics.DrawLines(pen, new[]
+                {
+                    new PointF(cx - 2.5f, cy - 4f),
+                    new PointF(cx + 1.5f, cy),
+                    new PointF(cx - 2.5f, cy + 4f),
+                });
+            }
+            catch { base.OnRenderArrow(e); }
+        }
+
+        protected override void OnRenderSeparator(ToolStripSeparatorRenderEventArgs e)
+        {
+            try
+            {
+                int y = e.Item.Height / 2;
+                int left = 12, right = e.Item.Width - 12;
+                if (right <= left) return;
+                using var pen = new Pen(Sep, 1f);
+                e.Graphics.DrawLine(pen, left, y, right, y);
+            }
+            catch { base.OnRenderSeparator(e); }
+        }
     }
 
     private static void EnsureAutoStartTaskHealthy()
@@ -781,6 +1274,100 @@ internal static class Program
         SetWindowPlacement(hwnd, ref wp);
     }
 
+    private static bool IsValidNormalRect(RECT rc) =>
+        rc.right > rc.left && rc.bottom > rc.top;
+
+    private static bool SameRect(RECT a, RECT b) =>
+        a.left == b.left && a.top == b.top && a.right == b.right && a.bottom == b.bottom;
+
+    private static bool IsRectOnScreen(RECT rc)
+    {
+        try
+        {
+            var r = Rectangle.FromLTRB(rc.left, rc.top, rc.right, rc.bottom);
+            foreach (var s in Screen.AllScreens)
+            {
+                try
+                {
+                    if (s.WorkingArea.IntersectsWith(r))
+                        return true;
+                }
+                catch { }
+            }
+            // No screen intersects: after a monitor unplug the saved coords would
+            // land off-screen and strand the window; let the app pick a default.
+            return false;
+        }
+        catch
+        {
+            return true; // screen query failed: don't block the restore
+        }
+    }
+
+    // Restores a normal window's saved position/size WITHOUT stealing focus,
+    // mirroring MaximizeNoSteal. A minimized-from-normal window keeps its
+    // minimized state (only its restore bounds are updated) so we never yank
+    // a minimized window up; a normal window gets its bounds applied.
+    private static void RestoreNormalBoundsNoSteal(IntPtr hwnd, RECT rc)
+    {
+        if (IsDialogClass(GetText(hwnd, GetClassName)))
+        {
+            RestoreDialogPositionOnly(hwnd, rc);
+            return;
+        }
+        if (!IsValidNormalRect(rc) || !IsRectOnScreen(rc))
+            return;
+        var wp = new WINDOWPLACEMENT { length = Marshal.SizeOf<WINDOWPLACEMENT>() };
+        if (!GetWindowPlacement(hwnd, ref wp))
+            return;
+        if (wp.showCmd == SW_SHOWMAXIMIZED)
+            return; // maximized: the maximize path owns this window
+        if (SameRect(wp.rcNormalPosition, rc))
+            return; // already there: avoid flicker
+        if (wp.showCmd == SW_SHOWMINIMIZED)
+        {
+            // Minimized (not from maximized - caller checked): update the bounds
+            // it will restore to, but stay minimized.
+            wp.rcNormalPosition = rc;
+            SetWindowPlacement(hwnd, ref wp);
+            return;
+        }
+        if (wp.showCmd != SW_SHOWNORMAL)
+            return; // hidden/other: leave alone
+        wp.showCmd = SW_SHOWNORMAL;
+        wp.flags = 0;
+        wp.rcNormalPosition = rc;
+        SetWindowPlacement(hwnd, ref wp);
+    }
+
+    // Move-only position restore for dialogs: same saved top-left, but the
+    // current size is kept, so no WM_SIZE / child re-layout fires mid-init.
+    // Posted async without activating or reordering, so it can't steal focus
+    // or block the watcher on a busy dialog.
+    private static void RestoreDialogPositionOnly(IntPtr hwnd, RECT rc)
+    {
+        if (!IsValidNormalRect(rc) || !IsRectOnScreen(rc))
+            return;
+        var wp = new WINDOWPLACEMENT { length = Marshal.SizeOf<WINDOWPLACEMENT>() };
+        if (!GetWindowPlacement(hwnd, ref wp))
+            return;
+        if (wp.showCmd == SW_SHOWMAXIMIZED)
+            return; // maximized: the maximize path owns this window
+        if (wp.rcNormalPosition.left == rc.left && wp.rcNormalPosition.top == rc.top)
+            return; // already there: avoid flicker
+        if (wp.showCmd == SW_SHOWMINIMIZED)
+        {
+            // Invisible: updating the restore bounds can't disturb init.
+            wp.rcNormalPosition = rc;
+            SetWindowPlacement(hwnd, ref wp);
+            return;
+        }
+        if (wp.showCmd != SW_SHOWNORMAL)
+            return; // hidden/other: leave alone
+        SetWindowPos(hwnd, IntPtr.Zero, rc.left, rc.top, 0, 0,
+            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
+    }
+
     private static void WatcherLoop(bool verbose)
     {
         var previous = new Dictionary<IntPtr, WinInfo>();
@@ -794,8 +1381,9 @@ internal static class Program
         // Closes are grouped per key for a few seconds: an app can close several
         // windows at once (e.g. Win11 Notepad owns several visible "Notepad"
         // windows). The window whose state changed most recently decides the
-        // group's state (see lastStateAt below).
-        var pendingCloses = new Dictionary<string, (bool Maximized, DateTime At, DateTime ChangeAt)>(StringComparer.Ordinal);
+        // group's state (see lastStateAt below). Bounds carries that winner's
+        // last normal position/size so a normal close also restores geometry.
+        var pendingCloses = new Dictionary<string, (bool Maximized, DateTime At, DateTime ChangeAt, RECT Bounds, bool HasBounds)>(StringComparer.Ordinal);
         var closeGroupWindow = TimeSpan.FromSeconds(3);
         // A close group is only trusted once it has been quiet this long: an app
         // closes its windows over several passes, and restoring from a partial
@@ -1000,6 +1588,16 @@ internal static class Program
         // Per hwnd: the (base key, instance index) assigned at first sight, kept until
         // the window closes or its base key changes (title settle). See WinInfo.Instance.
         var hwndInstance = new Dictionary<IntPtr, (string BaseKey, int Instance)>();
+        // Last known normal position/size per hwnd, updated whenever a window is
+        // seen in a normal (or minimized-from-normal) state. The snapshot only
+        // runs every ~2s, so a move+close inside one interval would otherwise
+        // record a stale rect; the fast pass keeps this fresh at 200ms while
+        // any maximized intent is live.
+        var lastNormalBounds = new Dictionary<IntPtr, RECT>();
+        // Windows whose normal bounds were already restored after opening (one-shot):
+        // without this the immediate path (re-checked every 50ms for 5s while the
+        // title settles) would fight a user move made right after opening.
+        var boundsRestored = new HashSet<IntPtr>();
         int tick = 0;
         var nextFull = DateTime.MinValue;
         // Foreground tracking to separate explicit Restore (demote while already
@@ -1110,6 +1708,10 @@ internal static class Program
                         if (!GetWindowPlacement(hwnd, ref placement)) continue; // gone; the full pass records the close
                         bool maximizedNow = placement.showCmd == SW_SHOWMAXIMIZED ||
                             (placement.showCmd == SW_SHOWMINIMIZED && (placement.flags & WPF_RESTORETOMAXIMIZED) != 0);
+                        // Keep the normal position/size fresh: a move+close inside one
+                        // full-pass interval would otherwise record a stale rect.
+                        if (!maximizedNow && IsValidNormalRect(placement.rcNormalPosition))
+                            lastNormalBounds[hwnd] = placement.rcNormalPosition;
                         // A maximized window reading "normal" for a single fast tick is usually a
                         // transient (DWM/animation), not a real un-maximize. Track WHEN the non-max
                         // state began; only a sustained one (past teardownGrace) is a genuine
@@ -1254,16 +1856,31 @@ internal static class Program
                         lastShowCmd.Remove(hwnd);
                         firstSeenAt.Remove(hwnd);
                         unMaximizedSince.Remove(hwnd);
+                        boundsRestored.Remove(hwnd);
                         closedAt[hwnd] = DateTime.Now;
+                        // Stage the normal position/size for a normal close: prefer the
+                        // fresh fast-pass rect (move+close inside one full interval),
+                        // else the last snapshot's rect. Maximized closes don't stage
+                        // bounds - the maximize path owns the next open.
+                        RECT stagedBounds = default;
+                        bool stagedHasBounds = false;
+                        if (!wasMaximized)
+                        {
+                            if (lastNormalBounds.TryGetValue(hwnd, out var fresh) && IsValidNormalRect(fresh))
+                            { stagedBounds = fresh; stagedHasBounds = true; }
+                            else if (IsValidNormalRect(info.NormalBounds))
+                            { stagedBounds = info.NormalBounds; stagedHasBounds = true; }
+                        }
+                        lastNormalBounds.Remove(hwnd);
                         if (pendingCloses.TryGetValue(info.Key, out var pc))
                         {
                             if (changeAt > pc.ChangeAt)
-                                pendingCloses[info.Key] = (wasMaximized, DateTime.Now, changeAt);
+                                pendingCloses[info.Key] = (wasMaximized, DateTime.Now, changeAt, stagedBounds, stagedHasBounds);
                             else
-                                pendingCloses[info.Key] = (pc.Maximized, DateTime.Now, pc.ChangeAt);
+                                pendingCloses[info.Key] = (pc.Maximized, DateTime.Now, pc.ChangeAt, pc.Bounds, pc.HasBounds);
                         }
                         else
-                            pendingCloses[info.Key] = (wasMaximized, DateTime.Now, changeAt);
+                            pendingCloses[info.Key] = (wasMaximized, DateTime.Now, changeAt, stagedBounds, stagedHasBounds);
                         restoreUntil.Remove(info.Key);
                     }
                 }
@@ -1275,6 +1892,8 @@ internal static class Program
                     {
                         pendingCloses.Remove(key);
                         RecordClosed(key, pc.Maximized);
+                        if (!pc.Maximized && pc.HasBounds)
+                            RecordNormalBounds(key, pc.Bounds);
                     }
                 }
 
@@ -1285,6 +1904,8 @@ internal static class Program
                 {
                     knownExes.Add(info.Exe);
                     maximizedIntent[hwnd] = info.Maximized;
+                    if (!info.Maximized && IsValidNormalRect(info.NormalBounds))
+                        lastNormalBounds[hwnd] = info.NormalBounds;
                     if (info.Maximized)
                     {
                         lastMaximizedAt[hwnd] = DateTime.Now;
@@ -1413,6 +2034,8 @@ internal static class Program
                             RecordClosed(info.Key, pc.Maximized);
                             if (pc.Maximized)
                                 restoreUntil[info.Key] = DateTime.Now + RestoreGiveUp; // quick restart: restore now
+                            else if (pc.HasBounds)
+                                RecordNormalBounds(info.Key, pc.Bounds);
                         }
                         else
                             continue; // still settling: don't restore on a stale record yet
@@ -1501,6 +2124,30 @@ internal static class Program
                         lastMaxAssert[hwnd] = DateTime.Now;
                         MaximizeNoSteal(hwnd);
                     }
+                    // Normal position/size: a window closed normal reopens with its
+                    // saved bounds. Maximized (record or live sibling) takes
+                    // precedence above, so reaching here means "should stay normal".
+                    // Same isNew/reopen gating as the maximize path so a later
+                    // resize by the user is never fought.
+                    else if (!boundsRestored.Contains(hwnd)
+                        && (!previous.ContainsKey(hwnd)
+                            || (previous.TryGetValue(hwnd, out var prevNorm) && prevNorm.Pid != info.Pid)
+                            || (previous[hwnd].Key != info.Key && firstSeenAt.TryGetValue(hwnd, out var firstSeenN)
+                                && DateTime.Now - firstSeenN <= titleSettleWindow)
+                            || (closedAt.TryGetValue(hwnd, out var closedWhenN) && DateTime.Now - closedWhenN <= reopenGrace
+                                && !(lastMaxAssert.TryGetValue(hwnd, out var lastRestoredN) && DateTime.Now - lastRestoredN <= reAssertGrace))
+                            || (reAppearMax.TryGetValue(hwnd, out var reappearedN) && DateTime.Now - reappearedN <= reAppearGrace
+                                && !(lastMaxAssert.TryGetValue(hwnd, out var lastRestoredN2) && DateTime.Now - lastRestoredN2 <= reAssertGrace)))
+                        && RecordState(info.Key) == 0
+                        && !current.Any(kv => kv.Key != hwnd && kv.Value.BaseKey == info.BaseKey
+                            && (kv.Value.Maximized || intendedMaximized.Contains(kv.Key)))
+                        && TryGetNormalBounds(info.Key, out var savedBounds)
+                        && !SameRect(info.NormalBounds, savedBounds))
+                    {
+                        Log($"restored {hwnd:X} {info.Key} bounds {savedBounds.left},{savedBounds.top},{savedBounds.right},{savedBounds.bottom} (normal{(IsDialogClass(info.Class) ? ", dialog-pos" : "")})");
+                        RestoreNormalBoundsNoSteal(hwnd, savedBounds);
+                        boundsRestored.Add(hwnd);
+                    }
                 }
 
                 previous = current;
@@ -1511,6 +2158,9 @@ internal static class Program
                 foreach (var h in hwndInstance.Keys.ToList())
                     if (!current.ContainsKey(h))
                         hwndInstance.Remove(h);
+                foreach (var h in boundsRestored.ToList())
+                    if (!current.ContainsKey(h))
+                        boundsRestored.Remove(h);
                 foreach (var h in closedAt.Keys.ToList())
                     if (DateTime.Now - closedAt[h] > reopenGrace)
                         closedAt.Remove(h);
@@ -1570,7 +2220,7 @@ internal static class Program
         // settling into a recorded key); false when decided (restored, or skipped
         // for good). Local function: reads pendingCloses on the same thread, so no
         // locking is needed.
-        bool TryRestoreNow(IntPtr hwnd, Dictionary<string, (bool Maximized, DateTime At, DateTime ChangeAt)> pending)
+        bool TryRestoreNow(IntPtr hwnd, Dictionary<string, (bool Maximized, DateTime At, DateTime ChangeAt, RECT Bounds, bool HasBounds)> pending)
         {
             try
             {
@@ -1662,6 +2312,7 @@ internal static class Program
                     Title = title,
                     Maximized = false,
                     ShowCmd = placement.showCmd,
+                    NormalBounds = placement.rcNormalPosition,
                     Instance = AssignInstance(hwnd, BuildBaseKey(exe, cls, title), hwndInstance),
                 }.Key;
                 // A close group may still be settling (the record is written only
@@ -1713,7 +2364,40 @@ internal static class Program
                             break;
                         }
                     }
-                    if (!shouldRestore) return false;
+                    if (!shouldRestore)
+                    {
+                        // Normal position/size: pending staged bounds win over the
+                        // flushed record (quick restart before the close group
+                        // flushes). Maximized already returned above, so reaching
+                        // here means "should stay normal". One-shot per hwnd: after
+                        // the first restore a user move must win, not be fought
+                        // for the 5s title-settle window. Dialogs are move-only
+                        // (see IsDialogClass), so position alone decides "already
+                        // there" for them.
+                        if (boundsRestored.Contains(hwnd))
+                            return false;
+                        RECT nb = default;
+                        bool hasNb = false;
+                        if (pending.TryGetValue(key, out var pcb) && !pcb.Maximized && pcb.HasBounds)
+                        { nb = pcb.Bounds; hasNb = true; }
+                        else if (TryGetNormalBounds(key, out var rb))
+                        { nb = rb; hasNb = true; }
+                        if (hasNb)
+                        {
+                            bool alreadyThere = IsDialogClass(cls)
+                                ? (placement.rcNormalPosition.left == nb.left && placement.rcNormalPosition.top == nb.top)
+                                : SameRect(placement.rcNormalPosition, nb);
+                            if (alreadyThere)
+                            {
+                                boundsRestored.Add(hwnd);
+                                return false; // already there: no flicker, no log spam
+                            }
+                            Log($"restored {hwnd:X} {key} bounds {nb.left},{nb.top},{nb.right},{nb.bottom} (immediate, normal{(IsDialogClass(cls) ? ", dialog-pos" : "")})");
+                            RestoreNormalBoundsNoSteal(hwnd, nb);
+                            boundsRestored.Add(hwnd);
+                        }
+                        return false;
+                    }
                 }
                 Log($"restored {hwnd:X} {key} (immediate)");
                 lastMaxAssert[hwnd] = DateTime.Now;
@@ -1802,7 +2486,7 @@ internal static class Program
         // must free its slot before a reopened window claims one, or a fast
         // close+reopen within one poll interval lands on |#2 and misses its |#1
         // record (random "forgot" misses).
-        var entries = new List<(IntPtr Hwnd, uint Pid, string Exe, string Class, string Title, string BaseKey, bool Maximized, int ShowCmd)>();
+        var entries = new List<(IntPtr Hwnd, uint Pid, string Exe, string Class, string Title, string BaseKey, bool Maximized, int ShowCmd, RECT NormalBounds)>();
 
         EnumWindows((hwnd, _) =>
         {
@@ -1824,11 +2508,13 @@ internal static class Program
             var placement = new WINDOWPLACEMENT { length = Marshal.SizeOf<WINDOWPLACEMENT>() };
             bool maximized = false;
             int showCmd = 0;
+            RECT normalBounds = default;
             if (GetWindowPlacement(hwnd, ref placement))
             {
                 showCmd = placement.showCmd;
                 maximized = placement.showCmd == SW_SHOWMAXIMIZED ||
                             (placement.showCmd == SW_SHOWMINIMIZED && (placement.flags & WPF_RESTORETOMAXIMIZED) != 0);
+                normalBounds = placement.rcNormalPosition;
             }
 
             // Reuse the exe name for windows we already track: the poll shouldn't
@@ -1842,7 +2528,7 @@ internal static class Program
             // value reused by a new process never inherits the old title.
             if (title.Length == 0 && prev != null && prev.Pid == pid && prev.Title.Length > 0)
                 title = prev.Title;
-            entries.Add((hwnd, pid, exe, cls, title, BuildBaseKey(exe, cls, title), maximized, showCmd));
+            entries.Add((hwnd, pid, exe, cls, title, BuildBaseKey(exe, cls, title), maximized, showCmd, normalBounds));
             return true;
         }, IntPtr.Zero);
 
@@ -1897,6 +2583,7 @@ internal static class Program
                 Title = e.Title,
                 Maximized = e.Maximized,
                 ShowCmd = e.ShowCmd,
+                NormalBounds = e.NormalBounds,
                 Instance = instance,
             };
         }
@@ -1987,6 +2674,70 @@ internal static class Program
         keyHandle.SetValue(RegValueName(key), maximized ? 1 : 0, RegistryValueKind.DWord);
         Log($"closed {key} ({(maximized ? "maximized" : "normal")})");
         SyncShortcutRunState(key, maximized);
+    }
+
+    private static string BoundsValueName(string key) => RegValueName(key + "|bounds");
+
+    private static void RecordNormalBounds(string key, RECT rc)
+    {
+        if (!IsValidNormalRect(rc))
+            return;
+        try
+        {
+            using var keyHandle = Registry.CurrentUser.CreateSubKey(RegRoot);
+            keyHandle.SetValue(BoundsValueName(key), $"{rc.left},{rc.top},{rc.right},{rc.bottom}", RegistryValueKind.String);
+            Log($"closed {key} bounds {rc.left},{rc.top},{rc.right},{rc.bottom} (normal)");
+        }
+        catch (Exception ex)
+        {
+            Log("bounds save failed: " + ex.Message);
+        }
+    }
+
+    private static bool TryGetNormalBounds(string key, out RECT rc)
+    {
+        rc = default;
+        try
+        {
+            string? raw = null;
+            try
+            {
+                if (_regRead == null)
+                {
+                    _regRead = Registry.CurrentUser.OpenSubKey(RegRoot);
+                    if (_regRead == null) return false;
+                }
+                raw = _regRead.GetValue(BoundsValueName(key)) as string;
+            }
+            catch
+            {
+                try { _regRead?.Dispose(); } catch { }
+                _regRead = null;
+                try
+                {
+                    using var fresh = Registry.CurrentUser.OpenSubKey(RegRoot);
+                    raw = fresh?.GetValue(BoundsValueName(key)) as string;
+                }
+                catch { return false; }
+            }
+            if (string.IsNullOrEmpty(raw))
+                return false;
+            var parts = raw.Split(',');
+            if (parts.Length != 4)
+                return false;
+            if (!int.TryParse(parts[0], out int l) || !int.TryParse(parts[1], out int t)
+                || !int.TryParse(parts[2], out int r) || !int.TryParse(parts[3], out int b))
+                return false;
+            var cand = new RECT { left = l, top = t, right = r, bottom = b };
+            if (!IsValidNormalRect(cand))
+                return false;
+            rc = cand;
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     // ---- Shortcut Run-state sync ----

@@ -1,11 +1,12 @@
 # WindowMaximizer
 
 A small Windows tray app that remembers whether each window was **closed maximized**
-and re-maximizes it the next time it opens. Works for classic Win32 windows
+and re-maximizes it the next time it opens, and remembers the **position/size**
+of windows closed normal. Works for classic Win32 windows
 (Notepad, Explorer, Chrome, ...) and UWP apps (Calculator, Settings, ...).
 
-Only windows that were *closed* maximized get restored. Windows closed normal
-are left alone. A window that is **minimized from maximized** still counts as
+Windows closed maximized reopen maximized; windows closed normal reopen with
+their saved position/size. A window that is **minimized from maximized** still counts as
 maximized, and if a new window of the same app opens while a sibling is
 maximized (or minimized from maximized), the new one comes up maximized too —
 so maximize a folder, minimize it, and reopen it and it stays maximized.
@@ -73,7 +74,10 @@ timings and managed-heap size.
 - When a window disappears, its last state is recorded in the registry:
   `HKCU\Software\WindowMaximizer` (one DWORD per window key
   `<exe>|<class>|<title>`, or `<exe>|<class>` when the window has no title).
-  Each titled window gets its own key so two Explorer folders or two Chrome
+  A normal close also records its position/size (`left,top,right,bottom` string
+  under the SHA-1 of `<key>|bounds`), restored with `SetWindowPlacement` on the
+  next open (skipped when off-screen after a monitor change; a minimized window
+  keeps its minimized state). Each titled window gets its own key so two Explorer folders or two Chrome
   windows keep separate state. Registry value names are SHA-1 hex digests of
   the key string (registry value names cannot contain backslashes). State
   survives app restarts.
@@ -90,7 +94,8 @@ timings and managed-heap size.
   Titled windows restore from their title key only; untitled windows use the
   class key (which is their key anyway).
 - When a window appears whose key was recorded as closed-maximized, it is
-  maximized via `ShowWindow(SW_SHOWMAXIMIZE)`.
+  maximized via `SetWindowPlacement` (no focus steal); when recorded as
+  closed-normal with saved bounds, its position/size is restored.
 - Closes are grouped per key (an app like Win11 Notepad owns several visible
   windows at once), and a short "recently maximized" history covers UWP's
   teardown animation, which briefly reverts the frame to normal on close.
