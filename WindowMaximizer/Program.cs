@@ -16,8 +16,8 @@ using Microsoft.Win32;
 // Win32 windows and UWP apps (ApplicationFrameHost frame windows).
 //
 // Runs in the system tray. Right-click the icon for the menu: "Start with
-// Windows (elevated)" (creates/removes a logon scheduled task), "Restart as
-// administrator", and "Exit".
+// Windows (elevated)" (creates/removes a logon scheduled task) and "Exit".
+// The app always runs elevated (requireAdministrator in app.manifest).
 //
 // State is stored per window "key" in HKCU\Software\WindowMaximizer.
 // A window's key is "<exe>|<class>" (plus "|<title>" for UWP frame windows,
@@ -434,13 +434,6 @@ internal static class Program
             }
         };
 
-        var adminItem = new ToolStripMenuItem("Restart as administrator")
-        {
-            Enabled = !IsElevated(), // no point when already elevated
-            ToolTipText = "Restores windows that run elevated (e.g. Task Manager)",
-        };
-        adminItem.Click += (_, _) => RestartElevated();
-
         // Theme submenu: System (follow Windows) is the default; Light/Dark override.
         var themeItem = new ToolStripMenuItem("Theme")
         {
@@ -472,7 +465,6 @@ internal static class Program
         exitItem.Click += (_, _) => Application.Exit();
 
         menu.Items.Add(startItem);
-        menu.Items.Add(adminItem);
         menu.Items.Add(themeItem);
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(exitItem);
@@ -627,30 +619,14 @@ internal static class Program
         return new WindowsPrincipal(identity).IsInRole(WindowsBuiltInRole.Administrator);
     }
 
-    private static void RestartElevated()
-    {
-        var exe = Environment.ProcessPath;
-        if (exe == null) return;
-        try
-        {
-            Process.Start(new ProcessStartInfo(exe) { UseShellExecute = true, Verb = "runas" });
-            Application.Exit();
-        }
-        catch (Exception ex)
-        {
-            Log("restart elevated failed: " + ex.Message); // user declined the UAC prompt
-        }
-    }
-
     // Called from the watcher thread when a restore gave up; marshals to the tray.
     private static void NotifyRestoreFailed(string key)
     {
         try
         {
             _notifyIcon?.ShowBalloonTip(8000, "WindowMaximizer",
-                $"Couldn't restore \"{key}\" to maximized. The window is likely running elevated " +
-                "(e.g. Task Manager), which Windows hides from non-admin apps. Right-click this icon " +
-                "and choose \"Restart as administrator\" to restore it.",
+                $"Couldn't restore \"{key}\" to maximized. The window is likely running at a higher " +
+                "privilege level (e.g. SYSTEM) that Windows blocks even from admin apps.",
                 ToolTipIcon.Warning);
         }
         catch { }
