@@ -119,20 +119,4 @@ dotnet build -c Release
 The exe lands at `WindowMaximizer/bin/Release/net10.0-windows/WindowMaximizer.exe`.
 
 The icon (`app.ico`, 16/24/32/48/256 px) is embedded in the exe and used as the
-tray icon. Regenerate it with `powershell -File gen-icon.ps1` if you want a
-different look.
-
-## Test
-
-`test.ps1` drives real apps the way Task Manager would (maximize → End Task →
-reopen) and asserts the behavior:
-
-```
-powershell -ExecutionPolicy Bypass -File test.ps1
-```
-
-- Classic window: Notepad — maximize, End Task (`taskkill /F`), reopen → must
-  come back maximized. Then close normal → reopen → must NOT be maximized.
-- UWP window: Calculator — same flow through its `ApplicationFrameWindow`.
-
-`-SkipClassic` / `-SkipUwp` / `-Discover` limit the run.
+tray icon.
