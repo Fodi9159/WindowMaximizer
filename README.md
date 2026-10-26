@@ -8,33 +8,33 @@ of windows closed normal. Works for classic Win32 windows
 Windows closed maximized reopen maximized; windows closed normal reopen with
 their saved position/size. A window that is **minimized from maximized** still counts as
 maximized, and if a new window of the same app opens while a sibling is
-maximized (or minimized from maximized), the new one comes up maximized too —
+maximized (or minimized from maximized), the new one comes up maximized too,
 so maximize a folder, minimize it, and reopen it and it stays maximized.
 
-Once a window is maximized, it **stays maximized** through minimize + reopen —
+Once a window is maximized, it **stays maximized** through minimize + reopen,
 no time limit: re-activating it (reopening the folder, or the window being
 restored) brings it back maximized no matter how long ago the maximize was.
 The only thing that ends that intent is an explicit **Restore** (un-maximizing
 a maximized window); after that the app leaves the window alone.
 
 **State is remembered per window**, not per app: each Explorer folder keeps its
-own state (two folders can differ — one maximized, one normal), and every UWP
+own state (two folders can differ, one maximized, one normal), and every UWP
 app is separate. On a **display change** (resolution change, monitor
 plugged/unplugged), windows that were maximized are re-maximized against the
 new work area, since Windows shrinks them; minimized windows are left alone.
 
 ## Usage
 
-Run `WindowMaximizer.exe` — it lives in the system tray (no console window).
+Run `WindowMaximizer.exe`. It lives in the system tray (no console window).
 Keep it running; it must be alive while windows open and close to record and
 restore state. Right-click the tray icon for the menu:
 
-- **Start with Windows (elevated)** — check/uncheck to enable or disable
+- **Start with Windows (elevated)**: check/uncheck to enable or disable
   auto-start at sign-in. Creates a scheduled task (`WindowMaximizer`, logon
   trigger, highest privileges) that starts the app **as administrator with no
-  UAC prompt** — see below for why that matters.
-- **Restart as administrator** — needed for apps that run elevated (see below).
-- **Exit** — closes the app.
+  UAC prompt**. See below for why that matters.
+- **Restart as administrator**: needed for apps that run elevated (see below).
+- **Exit**: closes the app.
 
 ### Elevated windows (e.g. Task Manager)
 
@@ -42,11 +42,11 @@ On Windows 11, Task Manager runs at a higher privilege level, and Windows
 silently refuses window changes from non-admin apps. So the watcher can record
 that Task Manager closed maximized but **cannot restore it unless it is itself
 running as administrator**. If a restore is blocked you'll get a tray
-notification — choose **Restart as administrator** from the menu. This applies
+notification. Choose **Restart as administrator** from the menu. This applies
 to any window of an elevated process.
 
 Auto-start is implemented as a scheduled task with `RunLevel=HighestAvailable`,
-so at sign-in the app is already elevated — no UAC prompt, no need to manually
+so at sign-in the app is already elevated, so no UAC prompt, no need to manually
 restart as admin. (The task replaces the old `HKCU\...\Run` value; enabling
 removes the legacy value, and disabling deletes the task.)
 
@@ -84,7 +84,7 @@ timings and managed-heap size.
 - **Same-title windows are disambiguated per instance**: the first window of a
   given key is stored under the plain key, the second under `|#2`, the third
   under `|#3`, and so on, so two windows titled "Untitled - Notepad" (or two
-  windows that momentarily share a title) each keep their own state — closing
+  windows that momentarily share a title) each keep their own state, so closing
   the first maximized doesn't make the second reopen maximized. Instance slots
   are freed when their window closes, so a new window of the same key takes
   over the freed slot (the one that was closed maximized, if any).

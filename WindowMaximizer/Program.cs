@@ -1999,7 +1999,7 @@ internal static class Program
                 foreach (var (hwnd, info) in current)
                 {
                     // Flush a pending close for this key now, so a quick restart is
-                    // restored too — but only once the group has settled. A partial
+                    // restored too, but only once the group has settled. A partial
                     // group (multi-window apps close over several passes) would
                     // record the wrong state.
                     if (pendingCloses.TryGetValue(info.Key, out var pc))
