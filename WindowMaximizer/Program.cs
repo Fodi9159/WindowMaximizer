@@ -234,11 +234,17 @@ internal static class Program
 
     // Standard Win32 dialogs build their children asynchronously during
     // WM_INITDIALOG (e.g. cleanmgr's "Disk Cleanup for (C:)" populates its file
-    // list while scanning). Resizing one mid-init breaks child creation and
-    // leaves the dialog blank, so dialogs get a move-only position restore
-    // (no WM_SIZE, no re-layout) instead of a full bounds restore. The
-    // maximized path still applies (dialogs are almost never maximized, and
-    // a maximized record on one means the user explicitly put it there).
+    // list while scanning), and ANY placement write during that phase - even a
+    // move-only SetWindowPos a full second after the dialog is visible - breaks
+    // child creation and leaves the dialog blank (cleanmgr, verified 2026-11).
+    // There is no external signal for "scan finished" (list items are data, not
+    // child windows), and once cleanmgr is initialized it REJECTS external moves
+    // outright (SetWindowPos returns TRUE but WM_WINDOWPOSCHANGING is forced to
+    // SWP_NOMOVE), so a deferred move would be a no-op anyway. Dialogs are
+    // therefore observe-only: their close position is recorded, but nothing is
+    // ever sent to them. The maximized path still applies (dialogs are almost
+    // never maximized, and a maximized record on one means the user explicitly
+    // put it there).
     private static bool IsDialogClass(string cls) =>
         cls.Equals("#32770", StringComparison.Ordinal);
 
@@ -1287,10 +1293,7 @@ internal static class Program
     private static void RestoreNormalBoundsNoSteal(IntPtr hwnd, RECT rc)
     {
         if (IsDialogClass(GetText(hwnd, GetClassName)))
-        {
-            RestoreDialogPositionOnly(hwnd, rc);
-            return;
-        }
+            return; // observe-only: see IsDialogClass - any write can blank the dialog
         if (!IsValidNormalRect(rc) || !IsRectOnScreen(rc))
             return;
         var wp = new WINDOWPLACEMENT { length = Marshal.SizeOf<WINDOWPLACEMENT>() };
@@ -1314,34 +1317,6 @@ internal static class Program
         wp.flags = 0;
         wp.rcNormalPosition = rc;
         SetWindowPlacement(hwnd, ref wp);
-    }
-
-    // Move-only position restore for dialogs: same saved top-left, but the
-    // current size is kept, so no WM_SIZE / child re-layout fires mid-init.
-    // Posted async without activating or reordering, so it can't steal focus
-    // or block the watcher on a busy dialog.
-    private static void RestoreDialogPositionOnly(IntPtr hwnd, RECT rc)
-    {
-        if (!IsValidNormalRect(rc) || !IsRectOnScreen(rc))
-            return;
-        var wp = new WINDOWPLACEMENT { length = Marshal.SizeOf<WINDOWPLACEMENT>() };
-        if (!GetWindowPlacement(hwnd, ref wp))
-            return;
-        if (wp.showCmd == SW_SHOWMAXIMIZED)
-            return; // maximized: the maximize path owns this window
-        if (wp.rcNormalPosition.left == rc.left && wp.rcNormalPosition.top == rc.top)
-            return; // already there: avoid flicker
-        if (wp.showCmd == SW_SHOWMINIMIZED)
-        {
-            // Invisible: updating the restore bounds can't disturb init.
-            wp.rcNormalPosition = rc;
-            SetWindowPlacement(hwnd, ref wp);
-            return;
-        }
-        if (wp.showCmd != SW_SHOWNORMAL)
-            return; // hidden/other: leave alone
-        SetWindowPos(hwnd, IntPtr.Zero, rc.left, rc.top, 0, 0,
-            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
     }
 
     private static void WatcherLoop(bool verbose)
@@ -2120,8 +2095,9 @@ internal static class Program
                         && TryGetNormalBounds(info.Key, out var savedBounds)
                         && !SameRect(info.NormalBounds, savedBounds))
                     {
-                        Log($"restored {hwnd:X} {info.Key} bounds {savedBounds.left},{savedBounds.top},{savedBounds.right},{savedBounds.bottom} (normal{(IsDialogClass(info.Class) ? ", dialog-pos" : "")})");
-                        RestoreNormalBoundsNoSteal(hwnd, savedBounds);
+                        Log($"restored {hwnd:X} {info.Key} bounds {savedBounds.left},{savedBounds.top},{savedBounds.right},{savedBounds.bottom} (normal{(IsDialogClass(info.Class) ? ", observe-only" : "")})");
+                        if (!IsDialogClass(info.Class))
+                            RestoreNormalBoundsNoSteal(hwnd, savedBounds);
                         boundsRestored.Add(hwnd);
                     }
                 }
@@ -2360,7 +2336,8 @@ internal static class Program
                         { nb = rb; hasNb = true; }
                         if (hasNb)
                         {
-                            bool alreadyThere = IsDialogClass(cls)
+                            bool isDialog = IsDialogClass(cls);
+                            bool alreadyThere = isDialog
                                 ? (placement.rcNormalPosition.left == nb.left && placement.rcNormalPosition.top == nb.top)
                                 : SameRect(placement.rcNormalPosition, nb);
                             if (alreadyThere)
@@ -2368,8 +2345,13 @@ internal static class Program
                                 boundsRestored.Add(hwnd);
                                 return false; // already there: no flicker, no log spam
                             }
-                            Log($"restored {hwnd:X} {key} bounds {nb.left},{nb.top},{nb.right},{nb.bottom} (immediate, normal{(IsDialogClass(cls) ? ", dialog-pos" : "")})");
-                            RestoreNormalBoundsNoSteal(hwnd, nb);
+                            if (isDialog)
+                                Log($"skipped {hwnd:X} {key} bounds {nb.left},{nb.top},{nb.right},{nb.bottom} (immediate, dialog observe-only)");
+                            else
+                            {
+                                Log($"restored {hwnd:X} {key} bounds {nb.left},{nb.top},{nb.right},{nb.bottom} (immediate, normal)");
+                                RestoreNormalBoundsNoSteal(hwnd, nb);
+                            }
                             boundsRestored.Add(hwnd);
                         }
                         return false;
