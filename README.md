@@ -78,7 +78,10 @@ timings and managed-heap size.
   under the SHA-1 of `<key>|bounds`), restored with `SetWindowPlacement` on the
   next open (skipped when off-screen after a monitor change; a minimized window
   keeps its minimized state). Each titled window gets its own key so two Explorer folders or two Chrome
-  windows keep separate state. Registry value names are SHA-1 hex digests of
+  windows keep separate state. Per-launch GUID suffixes in window classes are
+  stripped first (WPF's `HwndWrapper[App;;<guid>]`, Avalonia's
+  `Avalonia-<guid>`), so apps whose class changes on every launch still match
+  their record. Registry value names are SHA-1 hex digests of
   the key string (registry value names cannot contain backslashes). State
   survives app restarts.
 - **Same-title windows are disambiguated per instance**: the first window of a

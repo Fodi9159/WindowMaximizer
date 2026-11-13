@@ -209,8 +209,10 @@ internal static class Program
         // different states and reopen in swapped order, state follows order (the app
         // itself decides which window is "the same" - unknowable).
         public required int Instance;
-        // WPF windows carry a per-launch random GUID in their class (HwndWrapper[App;;<guid>]);
-        // strip it so the key is stable across launches and "closed maximized" restores.
+        // WPF windows carry a per-launch random GUID in their class (HwndWrapper[App;;<guid>])
+        // and Avalonia windows use the same idea with a dash (Avalonia-<guid>) that is
+        // regenerated for every window on every launch; strip it so the key is stable
+        // across launches and "closed maximized" restores.
         // ponytail: only strips a 36-char hex GUID, other classes untouched.
         public string BaseKey => BuildBaseKey(Exe, Class, Title);
         // Registry key: base key plus an instance suffix for siblings of the same
@@ -219,13 +221,26 @@ internal static class Program
         public string Key => Instance <= 1 ? BaseKey : $"{BaseKey}|#{Instance}";
     }
 
-    // ponytail: compiled once; the pattern is fixed-length so this avoids re-parsing every call.
+    // ponytail: compiled once; the patterns are fixed-length so this avoids re-parsing every call.
     private static readonly Regex WpfGuidSuffix = new(@";[0-9a-fA-F-]{36}", RegexOptions.Compiled);
+    // Avalonia-<8>-<4>-<4>-<4>-<12>; the class is otherwise the literal "Avalonia".
+    private static readonly Regex AvaloniaGuidSuffix = new(
+        @"-[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+        RegexOptions.Compiled);
+
+    private static string StableClass(string cls)
+    {
+        string stable = WpfGuidSuffix.Replace(cls, "");
+        // Only Avalonia classes carry this shape; leave every other class alone.
+        if (stable.StartsWith("Avalonia-", StringComparison.Ordinal))
+            stable = AvaloniaGuidSuffix.Replace(stable, "");
+        return stable;
+    }
 
     private static string BuildBaseKey(string exe, string cls, string title) =>
         string.IsNullOrEmpty(title)
-            ? $"{exe}|{WpfGuidSuffix.Replace(cls, "")}"
-            : $"{exe}|{WpfGuidSuffix.Replace(cls, "")}|{title}";
+            ? $"{exe}|{StableClass(cls)}"
+            : $"{exe}|{StableClass(cls)}|{title}";
 
     private static readonly HashSet<string> IgnoredClasses = new(StringComparer.OrdinalIgnoreCase)
     {
